@@ -1,0 +1,1 @@
+/home/dev/code/flyphoto-complete/app/build/usb_camera_sdk/intermediates/cxx/Debug/5g5n3h2q/obj/arm64-v8a

@@ -1,0 +1,1 @@
+/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/src/main/cpp/CMakeLists.txt

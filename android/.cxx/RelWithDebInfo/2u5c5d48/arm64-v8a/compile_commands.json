@@ -1,0 +1,7 @@
+[
+{
+  "directory": "/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/.cxx/RelWithDebInfo/2u5c5d48/arm64-v8a",
+  "command": "/home/dev/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android24 --sysroot=/home/dev/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dflyphoto_gphoto2_bridge_EXPORTS -I/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/src/main/cpp/include -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fexceptions -O2 -g -DNDEBUG -fPIC -o CMakeFiles/flyphoto_gphoto2_bridge.dir/flyphoto_gphoto2_bridge.cpp.o -c /home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/src/main/cpp/flyphoto_gphoto2_bridge.cpp",
+  "file": "/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/src/main/cpp/flyphoto_gphoto2_bridge.cpp"
+}
+]

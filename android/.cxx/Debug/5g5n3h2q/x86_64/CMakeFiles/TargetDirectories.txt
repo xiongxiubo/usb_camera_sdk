@@ -1,0 +1,3 @@
+/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/.cxx/Debug/5g5n3h2q/x86_64/CMakeFiles/flyphoto_gphoto2_bridge.dir
+/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/.cxx/Debug/5g5n3h2q/x86_64/CMakeFiles/edit_cache.dir
+/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/.cxx/Debug/5g5n3h2q/x86_64/CMakeFiles/rebuild_cache.dir

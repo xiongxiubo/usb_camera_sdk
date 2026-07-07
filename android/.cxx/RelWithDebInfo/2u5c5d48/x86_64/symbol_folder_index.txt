@@ -1,0 +1,1 @@
+/home/dev/code/flyphoto-complete/app/build/usb_camera_sdk/intermediates/cxx/RelWithDebInfo/2u5c5d48/obj/x86_64

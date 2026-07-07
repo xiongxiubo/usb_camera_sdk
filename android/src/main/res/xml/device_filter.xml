@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Still Image/PTP devices. Add camera-specific vendor/product filters here when needed. -->
+    <usb-device class="6" subclass="1" protocol="1" />
+</resources>

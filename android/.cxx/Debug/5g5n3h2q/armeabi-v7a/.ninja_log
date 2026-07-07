@@ -1,0 +1,3 @@
+# ninja log v5
+0	747	1783395192092607860	CMakeFiles/flyphoto_gphoto2_bridge.dir/flyphoto_gphoto2_bridge.cpp.o	819e4c13f88e790d
+749	804	1783395192154607332	/home/dev/code/flyphoto-complete/app/build/usb_camera_sdk/intermediates/cxx/Debug/5g5n3h2q/obj/armeabi-v7a/libflyphoto_gphoto2_bridge.so	4749685ae527864d

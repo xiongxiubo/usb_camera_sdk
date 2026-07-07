@@ -1,0 +1,43 @@
+{
+  "buildFiles": [
+    "/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/src/main/cpp/CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "/home/dev/Android/Sdk/cmake/3.22.1/bin/ninja",
+      "-C",
+      "/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/.cxx/Debug/5g5n3h2q/x86",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "/home/dev/Android/Sdk/cmake/3.22.1/bin/ninja",
+    "-C",
+    "/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/.cxx/Debug/5g5n3h2q/x86",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "flyphoto_gphoto2_bridge::@6890427a1f51a3e7e1df": {
+      "toolchain": "toolchain",
+      "abi": "x86",
+      "artifactName": "flyphoto_gphoto2_bridge",
+      "output": "/home/dev/code/flyphoto-complete/app/build/usb_camera_sdk/intermediates/cxx/Debug/5g5n3h2q/obj/x86/libflyphoto_gphoto2_bridge.so",
+      "runtimeFiles": [
+        "/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/src/main/jniLibs/x86/libgphoto2.so",
+        "/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/src/main/jniLibs/x86/libgphoto2_port.so",
+        "/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/src/main/jniLibs/x86/libusb-1.0.so",
+        "/home/dev/code/flyphoto-complete/packages/usb_camera_sdk/android/src/main/jniLibs/x86/libltdl.so"
+      ]
+    }
+  },
+  "toolchains": {
+    "toolchain": {
+      "cCompilerExecutable": "/home/dev/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/clang.lld",
+      "cppCompilerExecutable": "/home/dev/Android/Sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++.lld"
+    }
+  },
+  "cFileExtensions": [],
+  "cppFileExtensions": [
+    "cpp"
+  ]
+}
