@@ -7,6 +7,35 @@ enum CameraConnectionStatus {
   unsupported,
 }
 
+enum CameraIngestionMode {
+  eventAndPolling,
+  manualSync,
+}
+
+class UsbCameraCapabilities {
+  const UsbCameraCapabilities({
+    required this.ingestionMode,
+  });
+
+  final CameraIngestionMode ingestionMode;
+
+  bool get supportsAutomaticIngestion =>
+      ingestionMode == CameraIngestionMode.eventAndPolling;
+
+  static const eventAndPolling = UsbCameraCapabilities(
+    ingestionMode: CameraIngestionMode.eventAndPolling,
+  );
+
+  static const manualSync = UsbCameraCapabilities(
+    ingestionMode: CameraIngestionMode.manualSync,
+  );
+
+  factory UsbCameraCapabilities.forDevice(UsbCameraDevice device) {
+    if (device.isCanon) return manualSync;
+    return eventAndPolling;
+  }
+}
+
 class UsbCameraDevice {
   const UsbCameraDevice({
     required this.deviceName,
@@ -31,6 +60,11 @@ class UsbCameraDevice {
   final String? serialNumber;
 
   String get displayName => productName ?? manufacturerName ?? deviceName;
+
+  bool get isCanon => vendorId == 0x04a9;
+
+  UsbCameraCapabilities get capabilities =>
+      UsbCameraCapabilities.forDevice(this);
 
   factory UsbCameraDevice.fromMap(Map<dynamic, dynamic> map) {
     return UsbCameraDevice(

@@ -3,6 +3,7 @@ package com.flyphoto.usb_camera_sdk
 import android.app.Activity
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -12,6 +13,8 @@ import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
@@ -21,6 +24,7 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.time.LocalDateTime
+import java.util.concurrent.atomic.AtomicBoolean
 
 class UsbCameraSdkPlugin :
     FlutterPlugin,
@@ -37,11 +41,18 @@ class UsbCameraSdkPlugin :
     private var eventChannel: EventChannel? = null
     private var usbManager: UsbManager? = null
     private val bridge = GPhoto2Bridge()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val photoEventListening = AtomicBoolean(false)
+    private val pendingPhotoEventLock = Any()
+    private val cameraOperationLock = Any()
+    private val pendingPhotoEvents = mutableListOf<Map<String, Any?>>()
+    private var photoEventThread: Thread? = null
     private var eventSink: EventChannel.EventSink? = null
     private var pendingPermissionResult: MethodChannel.Result? = null
     private var activeConnection: UsbDeviceConnection? = null
     private var activeDevice: UsbDevice? = null
     private var receiverRegistered = false
+    private var downloadsLogUri: Uri? = null
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -115,16 +126,32 @@ class UsbCameraSdkPlugin :
                 disconnectCamera()
                 result.success(null)
             }
-            "capture" -> result.success(bridge.nativeCapture())
+            "releaseCameraControl" -> {
+                releaseCameraControl()
+                result.success(null)
+            }
+            "capture" -> capture(result)
             "listPhotos" -> result.success(listPhotos(call.argument<String>("folder") ?: "/"))
+            "drainPhotoEvents" -> result.success(drainPhotoEvents())
+            "startPhotoEventListening" -> {
+                startPhotoEventListening(result)
+            }
+            "stopPhotoEventListening" -> {
+                stopPhotoEventListening()
+                result.success(null)
+            }
             "downloadPhoto" -> downloadPhoto(
                 folder = call.argument<String>("folder") ?: "/",
                 name = call.argument<String>("name"),
                 result = result,
             )
-            "getCameraLog" -> result.success(cameraLogFile().readTextIfExists())
-            "getCameraLogPath" -> result.success(cameraLogFile().absolutePath)
+            "getCameraLog" -> result.success("")
+            "getCameraLogPath" -> result.success(cameraLogPath())
             "exportCameraLog" -> result.success(exportCameraLogToDownloads())
+            "appendCameraLog" -> {
+                appendCameraLog(call.argument<String>("message") ?: "")
+                result.success(null)
+            }
             else -> result.notImplemented()
         }
     }
@@ -235,13 +262,15 @@ class UsbCameraSdkPlugin :
 
         val pluginDir = preparePluginDirectory()
         val tempDir = File(applicationContext.cacheDir, "gphoto2").apply { mkdirs() }.absolutePath
-        val logFile = cameraLogFile()
-        bridge.nativeSetLogFile(logFile.absolutePath)
+        prepareCameraLogFile()
+        bridge.nativeSetLogFile("")
         appendCameraLog("pluginDir=$pluginDir")
         appendCameraLog("tempDir=$tempDir")
-        appendCameraLog("logFile=${logFile.absolutePath}")
+        appendCameraLog("logFile=${cameraLogPath()}")
         appendCameraLog("pluginFiles=${File(pluginDir, "lib/libgphoto2_port/0.12.2").listFiles()?.map { it.name }}")
-        val initResult = bridge.nativeInit(pluginDir, tempDir)
+        val initResult = synchronized(cameraOperationLock) {
+            bridge.nativeInit(pluginDir, tempDir)
+        }
         appendCameraLog("nativeInit=$initResult")
         if (initResult != "ok") {
             appendCameraLog("native_init_failed=$initResult")
@@ -252,12 +281,14 @@ class UsbCameraSdkPlugin :
             return
         }
 
-        val nativeResult = bridge.nativeConnectCamera(
-            connection.fileDescriptor,
-            device.vendorId,
-            device.productId,
-            device.deviceName,
-        )
+        val nativeResult = synchronized(cameraOperationLock) {
+            bridge.nativeConnectCamera(
+                connection.fileDescriptor,
+                device.vendorId,
+                device.productId,
+                device.deviceName,
+            )
+        }
         appendCameraLog("nativeConnectCamera=$nativeResult")
         if (nativeResult != "ok") {
             appendCameraLog("native_connect_failed=$nativeResult")
@@ -267,20 +298,61 @@ class UsbCameraSdkPlugin :
             result.error("native_connect_failed", nativeResult, device.toMap())
             return
         }
-
+        val isCanon = device.isCanon()
         val payload = device.toMap().toMutableMap().apply {
             put("model", device.productName ?: device.deviceName)
             put("pluginDir", pluginDir)
-            put("logFile", logFile.absolutePath)
-            put("exportedLogFile", exportCameraLogToDownloads())
+            put("logFile", cameraLogPath())
+            put("exportedLogFile", cameraLogPath())
+            put("isCanon", isCanon)
+            put("backend", "libgphoto2")
+            if (isCanon) put("canonStrategy", "physical_shutter_release_control")
+        }
+        if (isCanon) {
+            appendCameraLog("canon strategy=physical_shutter_release_control backend=libgphoto2")
         }
         appendCameraLog("connect success payload=$payload")
         emitEvent("connected", payload)
         result.success(payload)
     }
 
+    private fun capture(result: MethodChannel.Result) {
+        val start = System.currentTimeMillis()
+        appendCameraLog("capture start")
+        val nativeResult = synchronized(cameraOperationLock) {
+            bridge.nativeCapture()
+        }
+        val elapsed = System.currentTimeMillis() - start
+        appendCameraLog("capture result=$nativeResult elapsedMs=$elapsed")
+        if (isCameraPath(nativeResult)) {
+            result.success(nativeResult)
+            return
+        }
+        appendCameraLog("capture failed message=$nativeResult")
+        result.error(
+            "capture_failed",
+            nativeResult.ifBlank { "相机拍摄失败" },
+            mapOf("elapsed_ms" to elapsed),
+        )
+    }
+
+    private fun isCameraPath(value: String): Boolean {
+        val text = value.trim()
+        if (text.isEmpty()) return false
+        if (text.contains("|") || text.contains("\n")) return false
+        if (!text.contains("/")) return false
+        val name = text.substringAfterLast('/')
+        if (name.isBlank() || !name.contains('.')) return false
+        val extension = name.substringAfterLast('.', "").lowercase()
+        return extension in setOf(
+            "jpg", "jpeg", "jpe", "arw", "raw", "dng", "cr2", "cr3", "nef", "raf", "orf", "rw2", "pef", "srw", "x3f",
+        )
+    }
+
     private fun listPhotos(folder: String): List<Map<String, Any?>> {
-        return bridge.nativeListFiles(folder).map { encoded ->
+        return synchronized(cameraOperationLock) {
+            bridge.nativeListFiles(folder)
+        }.map { encoded ->
             val parts = encoded.split("|")
             mapOf(
                 "id" to encoded,
@@ -293,6 +365,94 @@ class UsbCameraSdkPlugin :
         }
     }
 
+    private fun drainPhotoEvents(): List<Map<String, Any?>> {
+        return synchronized(pendingPhotoEventLock) {
+            val events = pendingPhotoEvents.toList()
+            pendingPhotoEvents.clear()
+            events
+        }
+    }
+
+    private fun startPhotoEventListening(result: MethodChannel.Result) {
+        if (activeDevice == null || activeConnection == null) {
+            result.error("not_connected", "USB 相机未连接", null)
+            return
+        }
+        startPhotoEventListening()
+        result.success(null)
+    }
+
+    private fun startPhotoEventListening() {
+        if (activeDevice == null || activeConnection == null) {
+            appendCameraLog("photo event listening skipped: not connected")
+            return
+        }
+        if (!photoEventListening.compareAndSet(false, true)) return
+        appendCameraLog("photo event listening start")
+        photoEventThread = Thread({
+            while (photoEventListening.get()) {
+                val event = synchronized(cameraOperationLock) {
+                    bridge.nativeWaitForEvent(750)
+                }
+                if (!photoEventListening.get()) break
+                handlePhotoEventResult(event)
+            }
+            appendCameraLog("photo event listening stopped")
+        }, "FlyPhotoCameraEvents").also { it.start() }
+    }
+
+    private fun stopPhotoEventListening() {
+        if (!photoEventListening.getAndSet(false)) return
+        appendCameraLog("photo event listening stop requested")
+        val thread = photoEventThread
+        if (thread != null && thread != Thread.currentThread()) {
+            runCatching { thread.join(1200) }
+        }
+        photoEventThread = null
+    }
+
+    private fun handlePhotoEventResult(event: String) {
+        when {
+            event == "timeout" || event == "captureComplete" || event == "unknown" -> return
+            event == "disconnected" -> {
+                appendCameraLog("photo event disconnected")
+                photoEventListening.set(false)
+            }
+            event.startsWith("fileAdded|") -> {
+                val parts = event.split("|", limit = 3)
+                val folder = parts.getOrNull(1)?.ifBlank { "/" } ?: "/"
+                val name = parts.getOrNull(2).orEmpty()
+                appendCameraLog("photo event fileAdded folder=$folder name=$name")
+                if (name.isBlank()) return
+                val payload = photoPayload(folder, name)
+                synchronized(pendingPhotoEventLock) {
+                    pendingPhotoEvents.add(payload)
+                }
+                emitEvent("photoAdded", payload)
+            }
+            event.startsWith("folderAdded|") -> appendCameraLog("photo event $event")
+            event.startsWith("error|") -> {
+                appendCameraLog("photo event $event")
+                if (event.contains("Could not find the requested device on the USB port")) {
+                    photoEventListening.set(false)
+                }
+            }
+            else -> appendCameraLog("photo event unhandled=$event")
+        }
+    }
+
+    private fun photoPayload(folder: String, name: String): Map<String, Any?> {
+        val format = name.substringAfterLast('.', "JPG").uppercase()
+        return mapOf(
+            "id" to "$folder|$name|0|$format|--:--:--",
+            "folder" to folder,
+            "fileName" to name,
+            "sizeMb" to 0,
+            "format" to format,
+            "shotAt" to "--:--:--",
+        )
+    }
+
     private fun downloadPhoto(folder: String, name: String?, result: MethodChannel.Result) {
         if (name.isNullOrBlank()) {
             result.error("invalid_argument", "缺少照片文件名", null)
@@ -300,12 +460,26 @@ class UsbCameraSdkPlugin :
         }
         val downloads = File(applicationContext.cacheDir, "camera-downloads").apply { mkdirs() }
         val destination = File(downloads, name.substringAfterLast('/'))
-        val path = bridge.nativeDownload(folder, name, destination.absolutePath)
+        val path = synchronized(cameraOperationLock) {
+            bridge.nativeDownload(folder, name, destination.absolutePath)
+        }
         result.success(path)
     }
 
+    private fun releaseCameraControl() {
+        appendCameraLog("release camera control start")
+        stopPhotoEventListening()
+        synchronized(cameraOperationLock) {
+            bridge.nativeDisconnect()
+        }
+        appendCameraLog("release camera control done")
+    }
+
     private fun disconnectCamera() {
-        bridge.nativeDisconnect()
+        stopPhotoEventListening()
+        synchronized(cameraOperationLock) {
+            bridge.nativeDisconnect()
+        }
         activeConnection?.close()
         activeConnection = null
         activeDevice = null
@@ -337,60 +511,84 @@ class UsbCameraSdkPlugin :
         for (child in children) copyAssetTree("$assetPath/$child", File(output, child))
     }
 
-    private fun cameraLogFile(): File {
-        val dir = File(applicationContext.filesDir, "logs").apply { mkdirs() }
-        return File(dir, "camera-usb.log")
+    private fun prepareCameraLogFile() {
+        deleteInternalCameraLog()
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val resolver = applicationContext.contentResolver
+                val uri = downloadsLogUri ?: findOrCreateDownloadsLogUri()
+                downloadsLogUri = uri
+                resolver.openOutputStream(uri, "wt")?.use { output ->
+                    output.write("${LocalDateTime.now()} camera log start\n".toByteArray())
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                val file = legacyDownloadsLogFile()
+                file.parentFile?.mkdirs()
+                file.writeText("${LocalDateTime.now()} camera log start\n")
+            }
+        }
+    }
+
+    private fun cameraLogPath(): String {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            "Download/flyphoto-camera-usb.log"
+        } else {
+            legacyDownloadsLogFile().absolutePath
+        }
     }
 
     private fun appendCameraLog(message: String) {
         val line = "${LocalDateTime.now()} [android] $message\n"
-        cameraLogFile().appendText(line)
-    }
-
-    private fun exportCameraLogToDownloads(): String {
-        val source = cameraLogFile()
-        if (!source.exists()) return ""
-        val fileName = "flyphoto-camera-usb.log"
-        return runCatching {
+        runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val resolver = applicationContext.contentResolver
-                val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                val existingUri = resolver.query(
-                    collection,
-                    arrayOf(MediaStore.MediaColumns._ID),
-                    "${MediaStore.MediaColumns.DISPLAY_NAME}=?",
-                    arrayOf(fileName),
-                    null,
-                )?.use { cursor ->
-                    if (cursor.moveToFirst()) {
-                        Uri.withAppendedPath(collection, cursor.getLong(0).toString())
-                    } else {
-                        null
-                    }
+                val uri = downloadsLogUri ?: findOrCreateDownloadsLogUri()
+                downloadsLogUri = uri
+                resolver.openOutputStream(uri, "wa")?.use { output ->
+                    output.write(line.toByteArray())
                 }
-                val uri = existingUri ?: resolver.insert(
-                    collection,
-                    android.content.ContentValues().apply {
-                        put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                        put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-                    },
-                ) ?: return@runCatching ""
-                resolver.openOutputStream(uri, "wt")?.use { output ->
-                    source.inputStream().use { input -> input.copyTo(output) }
-                }
-                "Download/$fileName"
             } else {
-                @Suppress("DEPRECATION")
-                val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                downloads.mkdirs()
-                val target = File(downloads, fileName)
-                source.copyTo(target, overwrite = true)
-                target.absolutePath
+                legacyDownloadsLogFile().appendText(line)
             }
-        }.getOrElse { error ->
-            appendCameraLog("exportCameraLogToDownloads failed=${error.message}")
-            ""
+        }
+    }
+
+    private fun exportCameraLogToDownloads(): String = cameraLogPath()
+
+    private fun findOrCreateDownloadsLogUri(): Uri {
+        val resolver = applicationContext.contentResolver
+        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        resolver.query(
+            collection,
+            arrayOf(MediaStore.MediaColumns._ID),
+            "${MediaStore.MediaColumns.DISPLAY_NAME}=?",
+            arrayOf("flyphoto-camera-usb.log"),
+            null,
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                return Uri.withAppendedPath(collection, cursor.getLong(0).toString())
+            }
+        }
+        return resolver.insert(
+            collection,
+            ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, "flyphoto-camera-usb.log")
+                put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            },
+        ) ?: error("create Downloads log failed")
+    }
+
+    private fun legacyDownloadsLogFile(): File {
+        @Suppress("DEPRECATION")
+        val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        return File(downloads, "flyphoto-camera-usb.log")
+    }
+
+    private fun deleteInternalCameraLog() {
+        runCatching {
+            File(applicationContext.filesDir, "logs/camera-usb.log").delete()
         }
     }
 
@@ -399,7 +597,9 @@ class UsbCameraSdkPlugin :
     }
 
     private fun emitEvent(type: String, payload: Any?) {
-        eventSink?.success(mapOf("type" to type, "payload" to payload))
+        mainHandler.post {
+            eventSink?.success(mapOf("type" to type, "payload" to payload))
+        }
     }
 
     private fun Intent.usbDevice(): UsbDevice? {
@@ -410,6 +610,8 @@ class UsbCameraSdkPlugin :
             getParcelableExtra(UsbManager.EXTRA_DEVICE)
         }
     }
+
+    private fun UsbDevice.isCanon(): Boolean = vendorId == 0x04A9
 
     private fun UsbDevice.toMap(): Map<String, Any?> {
         return mapOf(
@@ -422,6 +624,7 @@ class UsbCameraSdkPlugin :
             "manufacturerName" to manufacturerName,
             "productName" to productName,
             "serialNumber" to runCatching { serialNumber }.getOrNull(),
+            "isCanon" to isCanon(),
         )
     }
 }

@@ -9,15 +9,18 @@ class UsbCameraRepository {
   UsbCameraRepository({
     MethodChannel? methodChannel,
     EventChannel? eventChannel,
-  })  : _methodChannel = methodChannel ?? const MethodChannel('flyphoto/camera_usb'),
-        _eventChannel = eventChannel ?? const EventChannel('flyphoto/camera_usb_events');
+  })  : _methodChannel =
+            methodChannel ?? const MethodChannel('flyphoto/camera_usb'),
+        _eventChannel =
+            eventChannel ?? const EventChannel('flyphoto/camera_usb_events');
 
   final MethodChannel _methodChannel;
   final EventChannel _eventChannel;
 
   Stream<Map<dynamic, dynamic>>? _events;
 
-  bool get isSupported => !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+  bool get isSupported =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
   Stream<Map<dynamic, dynamic>> get events {
     if (!isSupported) return const Stream.empty();
@@ -29,7 +32,8 @@ class UsbCameraRepository {
 
   Future<List<UsbCameraDevice>> listDevices() async {
     if (!isSupported) return const [];
-    final result = await _methodChannel.invokeListMethod<dynamic>('listDevices');
+    final result =
+        await _methodChannel.invokeListMethod<dynamic>('listDevices');
     return (result ?? const [])
         .whereType<Map<dynamic, dynamic>>()
         .map(UsbCameraDevice.fromMap)
@@ -46,12 +50,14 @@ class UsbCameraRepository {
   }
 
   Future<UsbCameraDevice> connect(UsbCameraDevice device) async {
-    if (!isSupported) throw const UsbCameraException('unsupported', '当前平台不支持 USB 相机');
+    if (!isSupported)
+      throw const UsbCameraException('unsupported', '当前平台不支持 USB 相机');
     final result = await _methodChannel.invokeMapMethod<dynamic, dynamic>(
       'connect',
       {'deviceName': device.deviceName},
     );
-    if (result == null) throw const UsbCameraException('connect_failed', '相机连接失败');
+    if (result == null)
+      throw const UsbCameraException('connect_failed', '相机连接失败');
     return UsbCameraDevice.fromMap(result);
   }
 
@@ -60,8 +66,14 @@ class UsbCameraRepository {
     await _methodChannel.invokeMethod<void>('disconnect');
   }
 
+  Future<void> releaseCameraControl() async {
+    if (!isSupported) return;
+    await _methodChannel.invokeMethod<void>('releaseCameraControl');
+  }
+
   Future<String> capture() async {
-    if (!isSupported) throw const UsbCameraException('unsupported', '当前平台不支持 USB 相机');
+    if (!isSupported)
+      throw const UsbCameraException('unsupported', '当前平台不支持 USB 相机');
     return await _methodChannel.invokeMethod<String>('capture') ?? '';
   }
 
@@ -77,8 +89,37 @@ class UsbCameraRepository {
         .toList();
   }
 
+  Future<List<UsbCameraPhoto>> drainPhotoEvents() async {
+    if (!isSupported) return const [];
+    final result = await _methodChannel.invokeListMethod<dynamic>(
+      'drainPhotoEvents',
+    );
+    return (result ?? const [])
+        .whereType<Map<dynamic, dynamic>>()
+        .map(UsbCameraPhoto.fromMap)
+        .toList();
+  }
+
+  Future<void> startPhotoEventListening() async {
+    if (!isSupported) return;
+    await _methodChannel.invokeMethod<void>('startPhotoEventListening');
+  }
+
+  Future<void> stopPhotoEventListening() async {
+    if (!isSupported) return;
+    await _methodChannel.invokeMethod<void>('stopPhotoEventListening');
+  }
+
+  Future<void> appendCameraLog(String message) async {
+    if (!isSupported || message.trim().isEmpty) return;
+    await _methodChannel.invokeMethod<void>('appendCameraLog', {
+      'message': message.trim(),
+    });
+  }
+
   Future<String> downloadPhoto(UsbCameraPhoto photo) async {
-    if (!isSupported) throw const UsbCameraException('unsupported', '当前平台不支持 USB 相机');
+    if (!isSupported)
+      throw const UsbCameraException('unsupported', '当前平台不支持 USB 相机');
     return await _methodChannel.invokeMethod<String>('downloadPhoto', {
           'folder': photo.folder,
           'name': photo.fileName,

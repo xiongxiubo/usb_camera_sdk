@@ -1,3 +1,11 @@
 # ninja log v5
 0	726	1783395276464889128	CMakeFiles/flyphoto_gphoto2_bridge.dir/flyphoto_gphoto2_bridge.cpp.o	febb80a84b79d7a3
 728	790	1783395276533888540	/home/dev/code/flyphoto-complete/app/build/usb_camera_sdk/intermediates/cxx/Debug/5g5n3h2q/obj/x86_64/libflyphoto_gphoto2_bridge.so	fab88a197abaff27
+2	812	1783412488924768484	CMakeFiles/flyphoto_gphoto2_bridge.dir/flyphoto_gphoto2_bridge.cpp.o	febb80a84b79d7a3
+812	844	1783412488962657222	/home/dev/code/flyphoto-complete/app/build/usb_camera_sdk/intermediates/cxx/Debug/5g5n3h2q/obj/x86_64/libflyphoto_gphoto2_bridge.so	fab88a197abaff27
+3	846	1783416692011442236	CMakeFiles/flyphoto_gphoto2_bridge.dir/flyphoto_gphoto2_bridge.cpp.o	febb80a84b79d7a3
+846	876	1783416692045144460	/home/dev/code/flyphoto-complete/app/build/usb_camera_sdk/intermediates/cxx/Debug/5g5n3h2q/obj/x86_64/libflyphoto_gphoto2_bridge.so	fab88a197abaff27
+2	801	1783488060043215812	CMakeFiles/flyphoto_gphoto2_bridge.dir/flyphoto_gphoto2_bridge.cpp.o	febb80a84b79d7a3
+801	850	1783488060082717655	/home/dev/code/flyphoto-complete/app/build/usb_camera_sdk/intermediates/cxx/Debug/5g5n3h2q/obj/x86_64/libflyphoto_gphoto2_bridge.so	fab88a197abaff27
+7	814	1783494614138559074	CMakeFiles/flyphoto_gphoto2_bridge.dir/flyphoto_gphoto2_bridge.cpp.o	febb80a84b79d7a3
+814	840	1783494614169431451	/home/dev/code/flyphoto-complete/app/build/usb_camera_sdk/intermediates/cxx/Debug/5g5n3h2q/obj/x86_64/libflyphoto_gphoto2_bridge.so	fab88a197abaff27

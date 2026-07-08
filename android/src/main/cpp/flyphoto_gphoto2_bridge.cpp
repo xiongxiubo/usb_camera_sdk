@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <iomanip>
 #include <mutex>
@@ -70,6 +71,7 @@ const char* log_level_name(GPLogLevel level) {
 }
 
 void gphoto_log_callback(GPLogLevel level, const char* domain, const char* str, void* /* data */) {
+    if (level != GP_LOG_ERROR) return;
     std::ostringstream stream;
     stream << "[libgphoto2] " << log_level_name(level) << " "
            << (domain == nullptr ? "" : domain) << " - "
@@ -93,6 +95,118 @@ std::string gp_error(int code) {
     if (code >= GP_OK) return "ok";
     const char* text = gp_result_as_string(code);
     return text == nullptr ? "libgphoto2 error " + std::to_string(code) : std::string(text);
+}
+
+bool is_canon_vendor(int vendor_id) {
+    return (vendor_id & 0xffff) == 0x04a9;
+}
+
+std::string widget_type_name(CameraWidgetType type) {
+    switch (type) {
+        case GP_WIDGET_WINDOW:
+            return "window";
+        case GP_WIDGET_SECTION:
+            return "section";
+        case GP_WIDGET_TEXT:
+            return "text";
+        case GP_WIDGET_RANGE:
+            return "range";
+        case GP_WIDGET_TOGGLE:
+            return "toggle";
+        case GP_WIDGET_RADIO:
+            return "radio";
+        case GP_WIDGET_MENU:
+            return "menu";
+        case GP_WIDGET_BUTTON:
+            return "button";
+        case GP_WIDGET_DATE:
+            return "date";
+    }
+    return "unknown";
+}
+
+void log_config_widget(CameraWidget* config, const char* name) {
+    if (config == nullptr || name == nullptr) return;
+    CameraWidget* widget = nullptr;
+    int result = gp_widget_get_child_by_name(config, name, &widget);
+    if (result < GP_OK || widget == nullptr) {
+        native_log(std::string("canon config ") + name + " missing result=" + std::to_string(result) + " " + gp_error(result));
+        return;
+    }
+
+    CameraWidgetType type = GP_WIDGET_WINDOW;
+    gp_widget_get_type(widget, &type);
+    std::ostringstream stream;
+    stream << "canon config " << name << " type=" << widget_type_name(type);
+
+    switch (type) {
+        case GP_WIDGET_TEXT:
+        case GP_WIDGET_RADIO:
+        case GP_WIDGET_MENU: {
+            const char* value = nullptr;
+            result = gp_widget_get_value(widget, &value);
+            stream << " value=" << (result >= GP_OK && value != nullptr ? value : "")
+                   << " valueResult=" << result << " " << gp_error(result);
+            const int choices = gp_widget_count_choices(widget);
+            stream << " choices=" << choices;
+            for (int i = 0; i < choices; ++i) {
+                const char* choice = nullptr;
+                if (gp_widget_get_choice(widget, i, &choice) >= GP_OK && choice != nullptr) {
+                    stream << " [" << i << "]=" << choice;
+                }
+            }
+            break;
+        }
+        case GP_WIDGET_TOGGLE: {
+            int value = 0;
+            result = gp_widget_get_value(widget, &value);
+            stream << " value=" << value << " valueResult=" << result << " " << gp_error(result);
+            break;
+        }
+        case GP_WIDGET_RANGE: {
+            float value = 0;
+            result = gp_widget_get_value(widget, &value);
+            stream << " value=" << value << " valueResult=" << result << " " << gp_error(result);
+            break;
+        }
+        case GP_WIDGET_DATE: {
+            int value = 0;
+            result = gp_widget_get_value(widget, &value);
+            stream << " value=" << value << " valueResult=" << result << " " << gp_error(result);
+            break;
+        }
+        default:
+            break;
+    }
+    native_log(stream.str());
+}
+
+void log_canon_diagnostics() {
+    if (!is_canon_vendor(g_vendor_id) || g_camera == nullptr || g_context == nullptr) return;
+    native_log("canon diagnostics start");
+
+    CameraText summary{};
+    int result = gp_camera_get_summary(g_camera, &summary, g_context);
+    native_log("canon summary result=" + std::to_string(result) + " " + gp_error(result));
+    if (result >= GP_OK) {
+        std::string text(summary.text);
+        if (text.size() > 600) text = text.substr(0, 600) + "...";
+        native_log("canon summary text=" + text);
+    }
+
+    CameraWidget* config = nullptr;
+    result = gp_camera_get_config(g_camera, &config, g_context);
+    native_log("canon get_config result=" + std::to_string(result) + " " + gp_error(result));
+    if (result >= GP_OK && config != nullptr) {
+        log_config_widget(config, "capturetarget");
+        log_config_widget(config, "eosremoterelease");
+        log_config_widget(config, "capture");
+        log_config_widget(config, "viewfinder");
+        log_config_widget(config, "eventmode");
+        log_config_widget(config, "output");
+        gp_widget_free(config);
+    }
+    native_log("canon diagnostics end");
 }
 
 std::string usb_id(int vendor_id, int product_id) {
@@ -324,7 +438,11 @@ Java_com_flyphoto_usb_1camera_1sdk_GPhoto2Bridge_nativeSetLogFile(
         gp_log_remove_func(g_log_func_id);
         g_log_func_id = -1;
     }
-    g_log_func_id = gp_log_add_func(GP_LOG_ALL, gphoto_log_callback, nullptr);
+    if (g_log_file_path.empty()) {
+        __android_log_print(ANDROID_LOG_INFO, kTag, "File logging disabled");
+        return;
+    }
+    g_log_func_id = gp_log_add_func(GP_LOG_ERROR, gphoto_log_callback, nullptr);
     append_log_line("\n========== camera connection log start ==========");
     native_log("Log file configured path=" + g_log_file_path + " gp_log_func_id=" + std::to_string(g_log_func_id));
 }
@@ -407,6 +525,7 @@ Java_com_flyphoto_usb_1camera_1sdk_GPhoto2Bridge_nativeConnectCamera(
         g_connected = false;
         return make_string(env, gp_error(init_result));
     }
+    log_canon_diagnostics();
     return make_string(env, "ok");
 }
 
@@ -434,6 +553,61 @@ Java_com_flyphoto_usb_1camera_1sdk_GPhoto2Bridge_nativeListFiles(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_com_flyphoto_usb_1camera_1sdk_GPhoto2Bridge_nativeWaitForEvent(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jint timeout_ms) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_connected || g_camera == nullptr || g_context == nullptr) {
+        native_log("wait event skipped: disconnected");
+        return make_string(env, "disconnected");
+    }
+
+    CameraEventType event_type = GP_EVENT_UNKNOWN;
+    void* event_data = nullptr;
+    const int timeout = timeout_ms <= 0 ? 750 : timeout_ms;
+    const int result = gp_camera_wait_for_event(g_camera, timeout, &event_type, &event_data, g_context);
+    if (result < GP_OK) {
+        if (event_data != nullptr) std::free(event_data);
+        return make_string(env, "error|" + gp_error(result));
+    }
+
+    std::string response;
+    switch (event_type) {
+        case GP_EVENT_TIMEOUT:
+            response = "timeout";
+            break;
+        case GP_EVENT_FILE_ADDED: {
+            auto* path = static_cast<CameraFilePath*>(event_data);
+            const std::string folder = path == nullptr ? "/" : path->folder;
+            const std::string name = path == nullptr ? "" : path->name;
+            native_log("wait event file added folder=" + folder + " name=" + name);
+            response = "fileAdded|" + folder + "|" + name;
+            break;
+        }
+        case GP_EVENT_FOLDER_ADDED: {
+            auto* path = static_cast<CameraFilePath*>(event_data);
+            const std::string folder = path == nullptr ? "/" : path->folder;
+            const std::string name = path == nullptr ? "" : path->name;
+            native_log("wait event folder added folder=" + folder + " name=" + name);
+            response = "folderAdded|" + folder + "|" + name;
+            break;
+        }
+        case GP_EVENT_CAPTURE_COMPLETE:
+            native_log("wait event capture complete");
+            response = "captureComplete";
+            break;
+        case GP_EVENT_UNKNOWN:
+        default:
+            native_log("wait event unknown type=" + std::to_string(event_type));
+            response = "unknown";
+            break;
+    }
+    if (event_data != nullptr) std::free(event_data);
+    return make_string(env, response);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_com_flyphoto_usb_1camera_1sdk_GPhoto2Bridge_nativeCapture(
     JNIEnv* env,
     jobject /* thiz */) {
@@ -442,10 +616,14 @@ Java_com_flyphoto_usb_1camera_1sdk_GPhoto2Bridge_nativeCapture(
         return make_string(env, "Camera is not connected");
     }
 
+    native_log("capture start");
     CameraFilePath path{};
     int result = gp_camera_capture(g_camera, GP_CAPTURE_IMAGE, &path, g_context);
+    native_log("gp_camera_capture result=" + std::to_string(result) + " " + gp_error(result));
     if (result < GP_OK) return make_string(env, gp_error(result));
-    return make_string(env, std::string(path.folder) + "/" + path.name);
+    const std::string camera_path = std::string(path.folder) + "/" + path.name;
+    native_log("capture success path=" + camera_path);
+    return make_string(env, camera_path);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
