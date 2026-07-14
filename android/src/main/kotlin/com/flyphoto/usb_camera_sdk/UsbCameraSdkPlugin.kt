@@ -51,6 +51,8 @@ class UsbCameraSdkPlugin :
     private var pendingPermissionResult: MethodChannel.Result? = null
     private var activeConnection: UsbDeviceConnection? = null
     private var activeDevice: UsbDevice? = null
+    private var canonPtpBackend: CanonPtpBackend? = null
+    private var activeBackend = "libgphoto2"
     private var receiverRegistered = false
     private var downloadsLogUri: Uri? = null
 
@@ -143,6 +145,7 @@ class UsbCameraSdkPlugin :
             "downloadPhoto" -> downloadPhoto(
                 folder = call.argument<String>("folder") ?: "/",
                 name = call.argument<String>("name"),
+                id = call.argument<String>("id"),
                 result = result,
             )
             "getCameraLog" -> result.success("")
@@ -248,17 +251,51 @@ class UsbCameraSdkPlugin :
             return
         }
 
-        val connection = manager.openDevice(device)
-        if (connection == null) {
+        var connection: UsbDeviceConnection = manager.openDevice(device) ?: run {
             appendCameraLog("open_failed")
             result.error("open_failed", "无法打开 USB 设备", device.toMap())
             return
         }
         appendCameraLog("openDevice ok fd=${connection.fileDescriptor}")
 
-        activeConnection?.close()
+        disconnectCamera()
         activeConnection = connection
         activeDevice = device
+        prepareCameraLogFile()
+
+        if (device.isCanon()) {
+            val canonicalConnection = connection
+            val canonConnected = runCatching {
+                CanonPtpBackend(
+                    connection = canonicalConnection,
+                    device = device,
+                    log = ::appendCameraLog,
+                    onPhotoAdded = ::handleCanonPhotoAdded,
+                ).also { backend ->
+                    backend.connect()
+                    canonPtpBackend = backend
+                    activeBackend = "canon_ptp"
+                }
+            }
+            if (canonConnected.isSuccess) {
+                completeConnection(result, device, pluginDir = null)
+                return
+            }
+
+            val canonError = canonConnected.exceptionOrNull()
+            appendCameraLog("canon_ptp connect failed; falling back to libgphoto2: ${canonError?.message}")
+            canonPtpBackend?.close()
+            canonPtpBackend = null
+            canonicalConnection.close()
+            connection = manager.openDevice(device) ?: run {
+                activeConnection = null
+                activeDevice = null
+                result.error("open_failed", "佳能 PTP 失败后无法重新打开 USB 设备", device.toMap())
+                return
+            }
+            activeConnection = connection
+            activeBackend = "libgphoto2_fallback"
+        }
 
         val pluginDir = preparePluginDirectory()
         val tempDir = File(applicationContext.cacheDir, "gphoto2").apply { mkdirs() }.absolutePath
@@ -298,18 +335,26 @@ class UsbCameraSdkPlugin :
             result.error("native_connect_failed", nativeResult, device.toMap())
             return
         }
+        completeConnection(result, device, pluginDir)
+    }
+
+    private fun completeConnection(
+        result: MethodChannel.Result,
+        device: UsbDevice,
+        pluginDir: String?,
+    ) {
         val isCanon = device.isCanon()
         val payload = device.toMap().toMutableMap().apply {
             put("model", device.productName ?: device.deviceName)
-            put("pluginDir", pluginDir)
+            if (pluginDir != null) put("pluginDir", pluginDir)
             put("logFile", cameraLogPath())
             put("exportedLogFile", cameraLogPath())
             put("isCanon", isCanon)
-            put("backend", "libgphoto2")
-            if (isCanon) put("canonStrategy", "physical_shutter_release_control")
+            put("backend", activeBackend)
+            if (isCanon) put("canonStrategy", "custom_ptp")
         }
         if (isCanon) {
-            appendCameraLog("canon strategy=physical_shutter_release_control backend=libgphoto2")
+            appendCameraLog("canon strategy=custom_ptp backend=$activeBackend")
         }
         appendCameraLog("connect success payload=$payload")
         emitEvent("connected", payload)
@@ -319,9 +364,17 @@ class UsbCameraSdkPlugin :
     private fun capture(result: MethodChannel.Result) {
         val start = System.currentTimeMillis()
         appendCameraLog("capture start")
-        val nativeResult = synchronized(cameraOperationLock) {
-            bridge.nativeCapture()
+        val canonBackend = canonPtpBackend
+        if (canonBackend != null) {
+            val photo = runCatching { canonBackend.capture() }.getOrElse { error ->
+                result.error("capture_failed", error.message ?: "佳能拍摄失败", null)
+                return
+            }
+            appendCameraLog("capture result=${photo.id} elapsedMs=${System.currentTimeMillis() - start}")
+            result.success(photo.id)
+            return
         }
+        val nativeResult = synchronized(cameraOperationLock) { bridge.nativeCapture() }
         val elapsed = System.currentTimeMillis() - start
         appendCameraLog("capture result=$nativeResult elapsedMs=$elapsed")
         if (isCameraPath(nativeResult)) {
@@ -350,6 +403,21 @@ class UsbCameraSdkPlugin :
     }
 
     private fun listPhotos(folder: String): List<Map<String, Any?>> {
+        canonPtpBackend?.let { backend ->
+            return runCatching { backend.listPhotos() }
+                .onFailure { error -> appendCameraLog("canon_ptp listPhotos failed: ${error.message}") }
+                .getOrDefault(emptyList())
+                .map { photo ->
+                    mapOf(
+                        "id" to photo.id,
+                        "folder" to photo.folder,
+                        "fileName" to photo.fileName,
+                        "sizeMb" to photo.sizeMb,
+                        "format" to photo.format,
+                        "shotAt" to photo.shotAt,
+                    )
+                }
+        }
         return synchronized(cameraOperationLock) {
             bridge.nativeListFiles(folder)
         }.map { encoded ->
@@ -389,6 +457,7 @@ class UsbCameraSdkPlugin :
         }
         if (!photoEventListening.compareAndSet(false, true)) return
         appendCameraLog("photo event listening start")
+        if (canonPtpBackend != null) return
         photoEventThread = Thread({
             while (photoEventListening.get()) {
                 val event = synchronized(cameraOperationLock) {
@@ -453,14 +522,30 @@ class UsbCameraSdkPlugin :
         )
     }
 
-    private fun downloadPhoto(folder: String, name: String?, result: MethodChannel.Result) {
+    private fun downloadPhoto(folder: String, name: String?, id: String?, result: MethodChannel.Result) {
         if (name.isNullOrBlank()) {
             result.error("invalid_argument", "缺少照片文件名", null)
             return
         }
         val downloads = File(applicationContext.cacheDir, "camera-downloads").apply { mkdirs() }
-        val destination = File(downloads, name.substringAfterLast('/'))
-        val path = synchronized(cameraOperationLock) {
+        val canonBackend = canonPtpBackend
+        val destinationName = if (canonBackend != null && !id.isNullOrBlank()) {
+            "${id.hashCode().toUInt().toString(16)}_${name.substringAfterLast('/')}"
+        } else {
+            name.substringAfterLast('/')
+        }
+        val destination = File(downloads, destinationName)
+        val path = canonBackend?.let { backend ->
+            val photoId = id ?: run {
+                result.error("invalid_argument", "缺少佳能照片 ID", null)
+                return
+            }
+            runCatching { backend.download(photoId, destination) }
+                .getOrElse { error ->
+                    result.error("download_failed", error.message ?: "佳能照片下载失败", null)
+                    return
+                }
+        } ?: synchronized(cameraOperationLock) {
             bridge.nativeDownload(folder, name, destination.absolutePath)
         }
         result.success(path)
@@ -469,21 +554,34 @@ class UsbCameraSdkPlugin :
     private fun releaseCameraControl() {
         appendCameraLog("release camera control start")
         stopPhotoEventListening()
-        synchronized(cameraOperationLock) {
-            bridge.nativeDisconnect()
-        }
+        canonPtpBackend?.close() ?: synchronized(cameraOperationLock) { bridge.nativeDisconnect() }
         appendCameraLog("release camera control done")
     }
 
     private fun disconnectCamera() {
         stopPhotoEventListening()
-        synchronized(cameraOperationLock) {
-            bridge.nativeDisconnect()
-        }
+        canonPtpBackend?.close()
+        canonPtpBackend = null
+        synchronized(cameraOperationLock) { bridge.nativeDisconnect() }
         activeConnection?.close()
         activeConnection = null
         activeDevice = null
+        activeBackend = "libgphoto2"
         emitEvent("disconnected", null)
+    }
+
+    private fun handleCanonPhotoAdded(photo: CanonPtpPhoto) {
+        if (!photoEventListening.get()) return
+        val payload = mapOf(
+            "id" to photo.id,
+            "folder" to photo.folder,
+            "fileName" to photo.fileName,
+            "sizeMb" to photo.sizeMb,
+            "format" to photo.format,
+            "shotAt" to photo.shotAt,
+        )
+        synchronized(pendingPhotoEventLock) { pendingPhotoEvents.add(payload) }
+        emitEvent("photoAdded", payload)
     }
 
     private fun findDevice(deviceName: String?): UsbDevice? {

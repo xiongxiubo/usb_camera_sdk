@@ -31,7 +31,6 @@ class UsbCameraCapabilities {
   );
 
   factory UsbCameraCapabilities.forDevice(UsbCameraDevice device) {
-    if (device.isCanon) return manualSync;
     return eventAndPolling;
   }
 }

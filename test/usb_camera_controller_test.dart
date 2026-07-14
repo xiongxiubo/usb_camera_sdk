@@ -21,6 +21,8 @@ class FakeUsbCameraRepository extends UsbCameraRepository {
   bool permissionGranted;
   List<UsbCameraDevice> devices;
   List<UsbCameraPhoto> photos;
+  String captureResult = '';
+  String downloadResult = '/cache/download.jpg';
   var startPhotoEventListeningCalls = 0;
   final _events = StreamController<Map<dynamic, dynamic>>.broadcast();
 
@@ -47,6 +49,12 @@ class FakeUsbCameraRepository extends UsbCameraRepository {
 
   @override
   Future<void> disconnect() async {}
+
+  @override
+  Future<String> capture() async => captureResult;
+
+  @override
+  Future<String> downloadPhoto(UsbCameraPhoto photo) async => downloadResult;
 
   @override
   Future<void> startPhotoEventListening() async {
@@ -110,16 +118,16 @@ void main() {
     expect(controller.photos.single.fileName, 'IMG_1.JPG');
   });
 
-  test('camera capabilities map automatic and manual sync ingestion', () async {
+  test('camera capabilities enable automatic ingestion for Canon and other cameras', () async {
     expect(
         device.capabilities.ingestionMode, CameraIngestionMode.eventAndPolling);
     expect(device.capabilities.supportsAutomaticIngestion, isTrue);
-    expect(
-        canonDevice.capabilities.ingestionMode, CameraIngestionMode.manualSync);
-    expect(canonDevice.capabilities.supportsAutomaticIngestion, isFalse);
+    expect(canonDevice.capabilities.ingestionMode,
+        CameraIngestionMode.eventAndPolling);
+    expect(canonDevice.capabilities.supportsAutomaticIngestion, isTrue);
   });
 
-  test('manual sync connect skips initial photo refresh and event listening',
+  test('Canon connect refreshes photos and enables event listening',
       () async {
     final repository = FakeUsbCameraRepository(
       devices: const [canonDevice],
@@ -132,16 +140,12 @@ void main() {
     final connected = await controller.connectFirstAvailable();
 
     expect(connected, isTrue);
-    expect(
-        controller.capabilities.ingestionMode, CameraIngestionMode.manualSync);
-    expect(controller.supportsAutomaticPhotoIngestion, isFalse);
-    expect(controller.photos, isEmpty);
+    expect(controller.capabilities.ingestionMode,
+        CameraIngestionMode.eventAndPolling);
+    expect(controller.supportsAutomaticPhotoIngestion, isTrue);
+    expect(controller.photos.single.fileName, 'IMG_1.JPG');
 
     await controller.startPhotoEventListening();
-
-    expect(repository.startPhotoEventListeningCalls, 0);
-
-    await controller.startPassivePhotoEventExperiment();
 
     expect(repository.startPhotoEventListeningCalls, 1);
     expect(controller.isPhotoEventListening, isTrue);
@@ -198,6 +202,32 @@ void main() {
     await controller.startPhotoEventListening();
 
     expect(repository.startPhotoEventListeningCalls, 1);
+  });
+
+  test('captureAndDownload resolves an opaque Canon PTP photo id', () async {
+    const ptpPhoto = UsbCameraPhoto(
+      id: 'canon-ptp:f1234567',
+      fileName: 'IMG_0001.JPG',
+      shotAt: '10:00:00',
+      sizeMb: 5,
+      format: 'JPG',
+      folder: '/ptp/1/0',
+    );
+    final repository = FakeUsbCameraRepository(
+      devices: const [canonDevice],
+      photos: const [ptpPhoto],
+    )
+      ..captureResult = ptpPhoto.id
+      ..downloadResult = '/cache/IMG_0001.JPG';
+    addTearDown(repository.close);
+    final controller = UsbCameraController(repository: repository);
+    addTearDown(controller.dispose);
+    await controller.connectFirstAvailable();
+
+    final localPath = await controller.captureAndDownload();
+
+    expect(localPath, '/cache/IMG_0001.JPG');
+    expect(controller.errorMessage, isNull);
   });
 
   test('photoAdded native event updates photos and emits added photo',

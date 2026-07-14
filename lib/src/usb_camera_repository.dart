@@ -121,6 +121,7 @@ class UsbCameraRepository {
     if (!isSupported)
       throw const UsbCameraException('unsupported', '当前平台不支持 USB 相机');
     return await _methodChannel.invokeMethod<String>('downloadPhoto', {
+          'id': photo.id,
           'folder': photo.folder,
           'name': photo.fileName,
         }) ??

@@ -71,7 +71,11 @@ void main() {
       'downloadPhoto',
     ]);
     expect(calls[1].arguments, {'deviceName': 'camera-1'});
-    expect(calls[4].arguments, {'folder': '/', 'name': 'IMG_1.JPG'});
+    expect(calls[4].arguments, {
+      'id': 'p1',
+      'folder': '/',
+      'name': 'IMG_1.JPG',
+    });
 
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, null);

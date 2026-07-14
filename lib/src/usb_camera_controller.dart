@@ -529,8 +529,9 @@ class UsbCameraController extends ChangeNotifier {
     List<UsbCameraPhoto> photos,
   ) {
     final normalized = capturedPath.trim();
-    if (normalized.isEmpty || !normalized.contains('/')) return null;
+    if (normalized.isEmpty) return null;
     for (final photo in photos) {
+      if (photo.id == normalized) return photo;
       final path = '${photo.folder}/${photo.fileName}'.replaceAll('//', '/');
       if (path == normalized || path.endsWith(normalized)) return photo;
     }
