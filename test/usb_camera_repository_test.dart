@@ -35,6 +35,7 @@ void main() {
             'productName': 'Test Camera',
           };
         case 'listPhotos':
+        case 'listNewPhotos':
           return [
             {
               'id': 'p1',
@@ -56,22 +57,25 @@ void main() {
     final granted = await repository.requestPermission(devices.first);
     final connected = await repository.connect(devices.first);
     final photos = await repository.listPhotos();
+    final newPhotos = await repository.listNewPhotos();
     final downloadedPath = await repository.downloadPhoto(photos.first);
 
     expect(devices.single.displayName, 'Test Camera');
     expect(granted, isTrue);
     expect(connected.deviceName, 'camera-1');
     expect(photos.single.fileName, 'IMG_1.JPG');
+    expect(newPhotos.single.fileName, 'IMG_1.JPG');
     expect(downloadedPath, '/cache/IMG_1.JPG');
     expect(calls.map((call) => call.method), [
       'listDevices',
       'requestPermission',
       'connect',
       'listPhotos',
+      'listNewPhotos',
       'downloadPhoto',
     ]);
     expect(calls[1].arguments, {'deviceName': 'camera-1'});
-    expect(calls[4].arguments, {
+    expect(calls[5].arguments, {
       'id': 'p1',
       'folder': '/',
       'name': 'IMG_1.JPG',

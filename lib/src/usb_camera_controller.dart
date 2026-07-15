@@ -88,7 +88,12 @@ class UsbCameraController extends ChangeNotifier {
       }
       _connectedDevice = await _repository.connect(device);
       _status = CameraConnectionStatus.connected;
-      if (supportsAutomaticPhotoIngestion) {
+      _photos = [];
+      if (isCanonConnected) {
+        await appendLog(
+          'camera connected: Canon shooting-first mode uses handle baseline and skips initial listPhotos',
+        );
+      } else if (supportsAutomaticPhotoIngestion) {
         await refreshPhotos();
       } else {
         await appendLog(
@@ -223,11 +228,11 @@ class UsbCameraController extends ChangeNotifier {
     if (!isConnected) return const [];
     try {
       final currentKeys = _photos.map(_photoPairKey).toSet();
-      final latest = _preferJpegPhotos(await _repository.listPhotos());
+      final latest = _preferJpegPhotos(await _repository.listNewPhotos());
       final fresh = latest
           .where((photo) => !currentKeys.contains(_photoPairKey(photo)))
           .toList();
-      if (fresh.isNotEmpty || latest.length != _photos.length) {
+      if (fresh.isNotEmpty) {
         _photos = [
           ...fresh,
           for (final photo in _photos)
@@ -266,7 +271,11 @@ class UsbCameraController extends ChangeNotifier {
         if (attempt > 1) {
           await Future<void>.delayed(const Duration(milliseconds: 500));
         }
-        await refreshPhotos();
+        if (isCanonConnected) {
+          await refreshPhotosIncremental();
+        } else {
+          await refreshPhotos();
+        }
         final companion = _findJpegCompanion(eventPhoto, _photos);
         if (companion != null) {
           await appendLog(
@@ -406,7 +415,11 @@ class UsbCameraController extends ChangeNotifier {
       if (attempt > 1) {
         await Future<void>.delayed(const Duration(milliseconds: 500));
       }
-      await refreshPhotos();
+      if (isCanonConnected) {
+        await refreshPhotosIncremental();
+      } else {
+        await refreshPhotos();
+      }
       final companion = _findJpegCompanion(photo, _photos);
       if (companion != null) return companion;
     }

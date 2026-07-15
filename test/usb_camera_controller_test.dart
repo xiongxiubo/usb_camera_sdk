@@ -24,6 +24,8 @@ class FakeUsbCameraRepository extends UsbCameraRepository {
   String captureResult = '';
   String downloadResult = '/cache/download.jpg';
   var startPhotoEventListeningCalls = 0;
+  var listPhotosCalls = 0;
+  var listNewPhotosCalls = 0;
   final _events = StreamController<Map<dynamic, dynamic>>.broadcast();
 
   @override
@@ -44,8 +46,16 @@ class FakeUsbCameraRepository extends UsbCameraRepository {
   Future<UsbCameraDevice> connect(UsbCameraDevice device) async => device;
 
   @override
-  Future<List<UsbCameraPhoto>> listPhotos({String folder = '/'}) async =>
-      photos;
+  Future<List<UsbCameraPhoto>> listPhotos({String folder = '/'}) async {
+    listPhotosCalls += 1;
+    return photos;
+  }
+
+  @override
+  Future<List<UsbCameraPhoto>> listNewPhotos({String folder = '/'}) async {
+    listNewPhotosCalls += 1;
+    return photos;
+  }
 
   @override
   Future<void> disconnect() async {}
@@ -118,7 +128,9 @@ void main() {
     expect(controller.photos.single.fileName, 'IMG_1.JPG');
   });
 
-  test('camera capabilities enable automatic ingestion for Canon and other cameras', () async {
+  test(
+      'camera capabilities enable automatic ingestion for Canon and other cameras',
+      () async {
     expect(
         device.capabilities.ingestionMode, CameraIngestionMode.eventAndPolling);
     expect(device.capabilities.supportsAutomaticIngestion, isTrue);
@@ -127,7 +139,7 @@ void main() {
     expect(canonDevice.capabilities.supportsAutomaticIngestion, isTrue);
   });
 
-  test('Canon connect refreshes photos and enables event listening',
+  test('Canon connect skips historical photos and enables event listening',
       () async {
     final repository = FakeUsbCameraRepository(
       devices: const [canonDevice],
@@ -143,7 +155,8 @@ void main() {
     expect(controller.capabilities.ingestionMode,
         CameraIngestionMode.eventAndPolling);
     expect(controller.supportsAutomaticPhotoIngestion, isTrue);
-    expect(controller.photos.single.fileName, 'IMG_1.JPG');
+    expect(controller.photos, isEmpty);
+    expect(repository.listPhotosCalls, 0);
 
     await controller.startPhotoEventListening();
 
@@ -183,6 +196,29 @@ void main() {
 
     expect(fresh.map((item) => item.id), ['p2']);
     expect(controller.photos.map((item) => item.id), ['p2', 'p1']);
+    expect(repository.listNewPhotosCalls, 1);
+  });
+
+  test('Canon incremental reconciliation recovers a missed photo once',
+      () async {
+    final repository = FakeUsbCameraRepository(
+      devices: const [canonDevice],
+      photos: const [],
+    );
+    addTearDown(repository.close);
+    final controller = UsbCameraController(repository: repository);
+    addTearDown(controller.dispose);
+    await controller.connectFirstAvailable();
+
+    repository.photos = [photo('canon-ptp:22', 'IMG_0022.JPG')];
+    final first = await controller.refreshPhotosIncremental();
+    final second = await controller.refreshPhotosIncremental();
+
+    expect(first.map((item) => item.id), ['canon-ptp:22']);
+    expect(second, isEmpty);
+    expect(controller.photos.map((item) => item.id), ['canon-ptp:22']);
+    expect(repository.listPhotosCalls, 0);
+    expect(repository.listNewPhotosCalls, 2);
   });
 
   test('automatic ingestion starts native photo event listening', () async {
@@ -240,6 +276,7 @@ void main() {
     final controller = UsbCameraController(repository: repository);
     addTearDown(controller.dispose);
     await controller.connectFirstAvailable();
+    final listCallsBeforeEvent = repository.listPhotosCalls;
 
     final added = controller.addedPhotos.first;
     repository.emit({
@@ -256,6 +293,43 @@ void main() {
 
     expect((await added).id, 'p2');
     expect(controller.photos.map((item) => item.id), ['p2', 'p1']);
+    expect(repository.listPhotosCalls, listCallsBeforeEvent);
+  });
+
+  test('burst JPEG events are delivered and de-duplicated without scans',
+      () async {
+    final repository = FakeUsbCameraRepository(
+      devices: const [device],
+      photos: [photo('p0', 'IMG_0.JPG')],
+    );
+    addTearDown(repository.close);
+    final controller = UsbCameraController(repository: repository);
+    addTearDown(controller.dispose);
+    await controller.connectFirstAvailable();
+    final listCallsBeforeEvents = repository.listPhotosCalls;
+    final added = <UsbCameraPhoto>[];
+    final subscription = controller.addedPhotos.listen(added.add);
+    addTearDown(subscription.cancel);
+
+    for (var index = 1; index <= 20; index += 1) {
+      repository.emit({
+        'type': 'photoAdded',
+        'payload': {
+          'id': 'p$index',
+          'folder': '/DCIM',
+          'fileName': 'IMG_$index.JPG',
+          'shotAt': '10:01:00',
+          'sizeMb': 6,
+          'format': 'JPG',
+        },
+      });
+    }
+    await Future<void>.delayed(Duration.zero);
+
+    expect(added, hasLength(20));
+    expect(controller.photos, hasLength(21));
+    expect(controller.photos.map((item) => item.id).toSet(), hasLength(21));
+    expect(repository.listPhotosCalls, listCallsBeforeEvents);
   });
 
   test('resolveAddedPhoto prefers JPEG companion for RAW capture events',

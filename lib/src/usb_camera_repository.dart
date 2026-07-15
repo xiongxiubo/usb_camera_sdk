@@ -89,6 +89,18 @@ class UsbCameraRepository {
         .toList();
   }
 
+  Future<List<UsbCameraPhoto>> listNewPhotos({String folder = '/'}) async {
+    if (!isSupported) return const [];
+    final result = await _methodChannel.invokeListMethod<dynamic>(
+      'listNewPhotos',
+      {'folder': folder},
+    );
+    return (result ?? const [])
+        .whereType<Map<dynamic, dynamic>>()
+        .map(UsbCameraPhoto.fromMap)
+        .toList();
+  }
+
   Future<List<UsbCameraPhoto>> drainPhotoEvents() async {
     if (!isSupported) return const [];
     final result = await _methodChannel.invokeListMethod<dynamic>(

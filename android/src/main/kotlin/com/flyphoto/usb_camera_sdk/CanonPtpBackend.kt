@@ -27,6 +27,7 @@ import java.nio.ByteOrder
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /** A small, SDK-owned EOS PTP implementation. It deliberately has no UI/service dependencies. */
 internal class CanonPtpBackend(
@@ -37,24 +38,50 @@ internal class CanonPtpBackend(
 ) {
     private val ioLock = Any()
     private val running = AtomicBoolean(false)
+    private val eventListening = AtomicBoolean(false)
+    private val eventGeneration = AtomicLong(0)
     private var ptpInterface: UsbInterface? = null
     private var bulkIn: UsbEndpoint? = null
     private var bulkOut: UsbEndpoint? = null
+    private lateinit var bulkReader: CanonPtpBulkReader
     private var transactionId = 0
     private var eventThread: Thread? = null
+    private val photoHandles = CanonPhotoHandleRegistry(
+        maxAttempts = PHOTO_INFO_MAX_ATTEMPTS,
+        maxAgeMs = PHOTO_INFO_MAX_AGE_MS,
+        publishedLimit = PUBLISHED_HANDLE_LIMIT,
+    )
+    private val handleCatalog = CanonHandleCatalog()
+    private val photoCache = mutableMapOf<Int, CanonPtpPhoto>()
+    private val inspectedHandles = mutableSetOf<Int>()
+    private var keepAliveSupported = true
+    private var lastKeepAliveAtMs = 0L
 
     fun connect() {
         selectPtpInterface()
         val intf = requireNotNull(ptpInterface)
+        val input = requireNotNull(bulkIn)
+        val output = requireNotNull(bulkOut)
+        bulkReader = CanonPtpBulkReader(AndroidBulkTransport(connection, input))
+        log(
+            "canon_ptp interface index=${intf.id} class=${intf.interfaceClass} " +
+                "bulkInPacket=${input.maxPacketSize} bulkOutPacket=${output.maxPacketSize}",
+        )
         check(connection.claimInterface(intf, true)) { "无法占用佳能 PTP USB 接口" }
         try {
             synchronized(ioLock) {
                 transaction(OPEN_SESSION, intArrayOf(1))
                 transaction(EOS_SET_PC_CONNECT_MODE, intArrayOf(1))
                 transaction(EOS_SET_EVENT_MODE, intArrayOf(1))
+                val snapshot = readHandleSnapshot()
+                replaceCatalogBaseline(snapshot)
+                log(
+                    "canon_ptp data probe ok storageCount=${snapshot.storageIds.size} " +
+                        "baselineHandles=${snapshot.allHandles.size}",
+                )
+                keepDeviceOnIfDue(force = true)
             }
             running.set(true)
-            startEventLoop()
             log("canon_ptp connected device=${device.deviceName}")
         } catch (error: Throwable) {
             close()
@@ -62,32 +89,119 @@ internal class CanonPtpBackend(
         }
     }
 
-    fun close() {
-        running.set(false)
-        eventThread?.let { thread ->
-            if (thread != Thread.currentThread()) thread.join(1_500)
+    fun startPhotoEventListening() {
+        check(running.get()) { "佳能 PTP 未连接" }
+        if (!eventListening.compareAndSet(false, true)) return
+        val generation = eventGeneration.incrementAndGet()
+        log("canon_ptp event listening start")
+        startEventLoop(generation)
+    }
+
+    fun stopPhotoEventListening() {
+        if (!eventListening.getAndSet(false)) return
+        eventGeneration.incrementAndGet()
+        log("canon_ptp event listening stop requested")
+        val thread = eventThread
+        if (thread != null && thread != Thread.currentThread()) {
+            runCatching { thread.join(EVENT_STOP_TIMEOUT_MS) }
         }
-        eventThread = null
+        if (thread?.isAlive == true) {
+            log("canon_ptp event listening stop timed out")
+        } else {
+            eventThread = null
+            log("canon_ptp event listening stopped")
+        }
+    }
+
+    fun close() {
+        stopPhotoEventListening()
+        running.set(false)
         synchronized(ioLock) {
-            runCatching { transaction(CLOSE_SESSION) }
+            runCatching { transaction(CLOSE_SESSION, timeoutMs = CLOSE_TIMEOUT_MS) }
+                .onFailure { error -> log("canon_ptp close session failed: ${error.message}") }
+            bulkReader.reset()
         }
         ptpInterface?.let { intf -> runCatching { connection.releaseInterface(intf) } }
         ptpInterface = null
         bulkIn = null
         bulkOut = null
+        photoHandles.clear()
+        handleCatalog.clear()
+        photoCache.clear()
+        inspectedHandles.clear()
+        keepAliveSupported = true
+        lastKeepAliveAtMs = 0L
+        log("canon_ptp closed device=${device.deviceName}")
     }
 
     fun listPhotos(): List<CanonPtpPhoto> = synchronized(ioLock) {
         check(running.get()) { "佳能 PTP 未连接" }
-        val storageIds = CanonPtpProtocol.decodeU32Array(transaction(GET_STORAGE_IDS).data)
+        val snapshot = readHandleSnapshot()
+        updateCatalogForFullList(snapshot)
         val photos = mutableListOf<CanonPtpPhoto>()
-        storageIds.forEach { storageId ->
-            val handles = CanonPtpProtocol.decodeU32Array(transaction(GET_OBJECT_HANDLES, intArrayOf(storageId, 0, 0)).data)
+        var inspectedSinceMaintenance = 0
+        snapshot.handlesByStorage.values.forEach { handles ->
             handles.forEach { handle ->
-                val info = getObjectInfo(handle) ?: return@forEach
-                if (!info.isPhoto) return@forEach
-                photos += info.toPhoto(handle)
+                photoCache[handle]?.let { cached ->
+                    photos += cached
+                    return@forEach
+                }
+                if (inspectedHandles.contains(handle)) return@forEach
+                val info = getObjectInfo(handle)
+                inspectedHandles += handle
+                info?.takeIf { it.isPhoto }?.toPhoto(handle)?.let { photo ->
+                    photoCache[handle] = photo
+                    photos += photo
+                }
+                inspectedSinceMaintenance += 1
+                if (inspectedSinceMaintenance >= FULL_SCAN_MAINTENANCE_BATCH) {
+                    performLongOperationMaintenance()
+                    inspectedSinceMaintenance = 0
+                }
             }
+        }
+        performLongOperationMaintenance()
+        log(
+            "canon_ptp full list complete handles=${snapshot.allHandles.size} " +
+                "photos=${photos.size} cached=${photoCache.size}",
+        )
+        photos.sortedByDescending { it.shotAt }
+    }
+
+    fun listNewPhotos(): List<CanonPtpPhoto> = synchronized(ioLock) {
+        check(running.get()) { "佳能 PTP 未连接" }
+        val snapshot = readHandleSnapshot()
+        if (!handleCatalog.hasSameStorage(snapshot.storageIds)) {
+            replaceCatalogBaseline(snapshot)
+            log(
+                "canon_ptp storage baseline reset storageCount=${snapshot.storageIds.size} " +
+                    "handles=${snapshot.allHandles.size}",
+            )
+            keepDeviceOnIfDue()
+            return@synchronized emptyList()
+        }
+        val newHandles = handleCatalog.reconcile(snapshot.allHandles)
+        val photos = newHandles.mapNotNull { handle ->
+            val info = runCatching { getObjectInfo(handle) }.getOrElse { error ->
+                if (isTransientPhotoInfoError(error)) {
+                    photoHandles.offer(handle, System.currentTimeMillis())
+                } else {
+                    inspectedHandles += handle
+                    log("canon_ptp incremental photo info failed handle=${handle.hex()}: ${error.message}")
+                }
+                return@mapNotNull null
+            }
+            inspectedHandles += handle
+            info?.takeIf { it.isPhoto }?.toPhoto(handle)?.also { photo ->
+                photoCache[handle] = photo
+                photoHandles.markPublished(handle)
+            }
+        }
+        keepDeviceOnIfDue()
+        if (newHandles.isNotEmpty()) {
+            log(
+                "canon_ptp incremental handles=${newHandles.size} photos=${photos.size}",
+            )
         }
         photos.sortedByDescending { it.shotAt }
     }
@@ -115,6 +229,7 @@ internal class CanonPtpBackend(
         runCatching { temporary.delete() }
         try {
             FileOutputStream(temporary).use { output -> downloadObject(handle, output) }
+            runCatching { destination.delete() }
             check(temporary.renameTo(destination)) { "无法完成佳能照片写入" }
             destination.absolutePath
         } catch (error: Throwable) {
@@ -123,41 +238,182 @@ internal class CanonPtpBackend(
         }
     }
 
-    private fun startEventLoop() {
+    private fun startEventLoop(generation: Long) {
         eventThread = Thread({
-            while (running.get()) {
+            while (isActiveEventGeneration(generation)) {
                 runCatching {
                     synchronized(ioLock) {
-                        if (running.get()) handleEosEvents(transaction(EOS_EVENT_CHECK).data)
+                        if (isActiveEventGeneration(generation)) {
+                            val eventData = transaction(
+                                EOS_EVENT_CHECK,
+                                timeoutMs = EVENT_USB_TIMEOUT_MS,
+                            ).data
+                            if (!isActiveEventGeneration(generation)) return@synchronized
+                            handleEosEvents(eventData)
+                            resolvePendingPhotos()
+                            keepDeviceOnIfDue()
+                        }
                     }
                 }.onFailure { error ->
-                    if (running.get()) log("canon_ptp event check failed: ${error.message}")
+                    if (isActiveEventGeneration(generation)) {
+                        log("canon_ptp event check failed: ${error.message}")
+                    }
                 }
-                if (running.get()) Thread.sleep(EVENT_PERIOD_MS)
+                if (isActiveEventGeneration(generation)) Thread.sleep(EVENT_PERIOD_MS)
             }
+            if (Thread.currentThread() == eventThread) eventThread = null
         }, "FlyPhotoCanonPtpEvents").also { it.start() }
     }
 
+    private fun isActiveEventGeneration(generation: Long): Boolean {
+        return running.get() && eventListening.get() && eventGeneration.get() == generation
+    }
+
     private fun handleEosEvents(payload: ByteArray) {
-        val buffer = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
-        while (buffer.remaining() >= 8) {
-            val eventStart = buffer.position()
-            val eventLength = buffer.int
-            val eventCode = buffer.int
-            if (eventLength < 8 || eventLength > buffer.remaining() + 8) {
-                log("canon_ptp malformed EOS event length=$eventLength")
-                return
+        val batch = CanonEosEventParser.decode(payload)
+        batch.malformedLength?.let { length ->
+            log("canon_ptp malformed EOS event length=$length")
+        }
+        val now = System.currentTimeMillis()
+        batch.events.forEach { event ->
+            if (event.code != 0) {
+                log(
+                    "canon_ptp EOS event code=${event.code.hex()} length=${event.length}" +
+                        (event.photo?.let { " handle=${it.handle.hex()} name=${it.fileName}" } ?: ""),
+                )
             }
-            if ((eventCode == EOS_OBJECT_ADDED || eventCode == EOS_DIR_ITEM_CREATED) && buffer.remaining() >= 10) {
-                val handle = buffer.int
-                buffer.int // storage id; ObjectInfo remains the source of truth.
-                buffer.short // object format; ObjectInfo remains the source of truth.
-                getObjectInfo(handle)?.takeIf { it.isPhoto }?.let { info ->
-                    publishPhoto(info.toPhoto(handle))
+            if (event.code == CanonEosEventParser.WILL_SOON_SHUTDOWN) {
+                keepDeviceOnIfDue(force = true)
+                return@forEach
+            }
+            if (event.code != CanonEosEventParser.OBJECT_ADDED_EX &&
+                event.code != CanonEosEventParser.OBJECT_ADDED_EX_64
+            ) {
+                return@forEach
+            }
+            val eosPhoto = event.photo
+            val handle = eosPhoto?.handle ?: return@forEach
+            handleCatalog.observe(handle)
+            if (photoCache.containsKey(handle)) return@forEach
+            if (!photoHandles.offer(handle, now)) return@forEach
+            val photo = eosPhoto.toPhotoOrNull()
+            if (photo == null) return@forEach
+            inspectedHandles += handle
+            photoCache[handle] = photo
+            photoHandles.markPublished(handle)
+            publishPhoto(photo)
+        }
+    }
+
+    private fun resolvePendingPhotos() {
+        val now = System.currentTimeMillis()
+        photoHandles.pendingHandles().forEach { handle ->
+            val info = runCatching { getObjectInfo(handle) }.getOrElse { error ->
+                val failure = photoHandles.recordFailure(
+                    handle = handle,
+                    nowMs = now,
+                    transient = isTransientPhotoInfoError(error),
+                )
+                if (!failure.willRetry) {
+                    log(
+                        "canon_ptp photo info failed handle=${handle.toUInt().toString(16)} " +
+                            "attempts=${failure.attempts} error=${error.message}",
+                    )
+                }
+                return@forEach
+            }
+            if (info == null || !info.isPhoto) {
+                photoHandles.discard(handle)
+                inspectedHandles += handle
+                return@forEach
+            }
+            val photo = info.toPhoto(handle)
+            handleCatalog.observe(handle)
+            inspectedHandles += handle
+            photoCache[handle] = photo
+            photoHandles.markPublished(handle)
+            publishPhoto(photo)
+        }
+    }
+
+    private fun CanonEosPhotoEvent.toPhotoOrNull(): CanonPtpPhoto? {
+        if (handle == 0 || fileName.isBlank()) return null
+        val extension = fileName.substringAfterLast('.', "").lowercase()
+        if (extension !in PHOTO_EXTENSIONS) return null
+        return CanonPtpPhoto(
+            id = CanonPtpProtocol.photoId(handle),
+            folder = "/ptp/${storageId.toUInt().toString(16)}/${parentObject.toUInt().toString(16)}",
+            fileName = fileName,
+            sizeMb = (compressedSize / (1024 * 1024)).toInt(),
+            format = extension.uppercase(),
+            shotAt = "--:--:--",
+        )
+    }
+
+    private fun readHandleSnapshot(): HandleSnapshot {
+        val storageIds = CanonPtpProtocol.decodeU32Array(transaction(GET_STORAGE_IDS).data)
+        val handlesByStorage = linkedMapOf<Int, IntArray>()
+        storageIds.forEach { storageId ->
+            handlesByStorage[storageId] = CanonPtpProtocol.decodeU32Array(
+                transaction(GET_OBJECT_HANDLES, intArrayOf(storageId, 0, 0)).data,
+            )
+        }
+        return HandleSnapshot(handlesByStorage)
+    }
+
+    private fun replaceCatalogBaseline(snapshot: HandleSnapshot) {
+        handleCatalog.replaceBaseline(snapshot.storageIds, snapshot.allHandles)
+        photoCache.clear()
+        inspectedHandles.clear()
+        photoHandles.clear()
+    }
+
+    private fun updateCatalogForFullList(snapshot: HandleSnapshot) {
+        if (!handleCatalog.hasSameStorage(snapshot.storageIds)) {
+            replaceCatalogBaseline(snapshot)
+            return
+        }
+        handleCatalog.reconcile(snapshot.allHandles)
+        photoCache.keys.retainAll(snapshot.allHandles)
+        inspectedHandles.retainAll(snapshot.allHandles)
+    }
+
+    private fun performLongOperationMaintenance() {
+        runCatching {
+            val eventData = transaction(EOS_EVENT_CHECK, timeoutMs = EVENT_USB_TIMEOUT_MS).data
+            handleEosEvents(eventData)
+            resolvePendingPhotos()
+        }.onFailure { error ->
+            log("canon_ptp full scan event maintenance failed: ${error.message}")
+        }
+        keepDeviceOnIfDue()
+    }
+
+    private fun keepDeviceOnIfDue(force: Boolean = false) {
+        if (!keepAliveSupported || !running.get() && !force) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastKeepAliveAtMs < KEEP_ALIVE_INTERVAL_MS) return
+        lastKeepAliveAtMs = now
+        runCatching { transaction(EOS_KEEP_DEVICE_ON, timeoutMs = KEEP_ALIVE_TIMEOUT_MS) }
+            .onSuccess {
+                if (force) log("canon_ptp keepalive ok")
+            }
+            .onFailure { error ->
+                if (error is CanonPtpResponseException &&
+                    error.responseCode == RESPONSE_OPERATION_NOT_SUPPORTED
+                ) {
+                    keepAliveSupported = false
+                    log("canon_ptp keepalive unsupported; disabled for session")
+                } else {
+                    log("canon_ptp keepalive failed: ${error.message}")
                 }
             }
-            buffer.position((eventStart + eventLength).coerceAtMost(buffer.limit()))
-        }
+    }
+
+    private fun isTransientPhotoInfoError(error: Throwable): Boolean {
+        return error is CanonPtpTransportException ||
+            error is CanonPtpResponseException &&
+            error.responseCode in setOf(RESPONSE_DEVICE_BUSY, RESPONSE_INVALID_OBJECT_HANDLE)
     }
 
     private fun publishPhoto(photo: CanonPtpPhoto) {
@@ -172,38 +428,49 @@ internal class CanonPtpBackend(
     }
 
     private fun downloadObject(handle: Int, output: FileOutputStream) {
-        writeCommand(GET_OBJECT, intArrayOf(handle))
+        val expectedTransactionId = writeCommand(GET_OBJECT, intArrayOf(handle))
         var responseReceived = false
         while (!responseReceived) {
-            val header = readHeader()
+            val header = readHeader(USB_TIMEOUT_MS)
+            validateHeader(header, GET_OBJECT, expectedTransactionId, allowLargeData = true)
             when (header.type) {
                 CONTAINER_DATA -> {
                     check(header.length >= CONTAINER_HEADER_SIZE) { "佳能返回了无效照片数据包" }
-                    copyToStream(header.length - CONTAINER_HEADER_SIZE, output)
+                    bulkReader.copyExactly(
+                        header.length - CONTAINER_HEADER_SIZE,
+                        output,
+                        USB_TIMEOUT_MS,
+                    )
                 }
                 CONTAINER_RESPONSE -> {
-                    discard(header.length - CONTAINER_HEADER_SIZE)
-                    check(header.code == RESPONSE_OK) { "佳能下载失败: ${responseName(header.code)}" }
+                    discard(header.length - CONTAINER_HEADER_SIZE, USB_TIMEOUT_MS)
+                    if (header.code != RESPONSE_OK) {
+                        throw CanonPtpResponseException(GET_OBJECT, header.code)
+                    }
                     responseReceived = true
                 }
                 else -> {
-                    discard(header.length - CONTAINER_HEADER_SIZE)
+                    discard(header.length - CONTAINER_HEADER_SIZE, USB_TIMEOUT_MS)
                     throw IllegalStateException("佳能下载收到未知 PTP 包 type=${header.type}")
                 }
             }
         }
     }
 
-    private fun transaction(operation: Int, parameters: IntArray = intArrayOf()): PtpResult {
-        writeCommand(operation, parameters)
+    private fun transaction(
+        operation: Int,
+        parameters: IntArray = intArrayOf(),
+        timeoutMs: Int = USB_TIMEOUT_MS,
+    ): PtpResult {
+        val expectedTransactionId = writeCommand(operation, parameters, timeoutMs)
         var data = ByteArray(0)
         while (true) {
-            val container = readContainer()
+            val container = readContainer(operation, expectedTransactionId, timeoutMs)
             when (container.type) {
                 CONTAINER_DATA -> data = container.payload
                 CONTAINER_RESPONSE -> {
-                    check(container.code == RESPONSE_OK) {
-                        "佳能 PTP 0x${operation.toString(16)} 失败: ${responseName(container.code)}"
+                    if (container.code != RESPONSE_OK) {
+                        throw CanonPtpResponseException(operation, container.code)
                     }
                     return PtpResult(data)
                 }
@@ -212,63 +479,79 @@ internal class CanonPtpBackend(
         }
     }
 
-    private fun writeCommand(operation: Int, parameters: IntArray) {
+    private fun writeCommand(
+        operation: Int,
+        parameters: IntArray,
+        timeoutMs: Int = USB_TIMEOUT_MS,
+    ): Int {
+        val currentTransactionId = transactionId++
         val packet = ByteBuffer.allocate(CONTAINER_HEADER_SIZE + parameters.size * 4)
             .order(ByteOrder.LITTLE_ENDIAN)
         packet.putInt(packet.capacity())
         packet.putShort(CONTAINER_COMMAND.toShort())
         packet.putShort(operation.toShort())
-        packet.putInt(transactionId++)
+        packet.putInt(currentTransactionId)
         parameters.forEach(packet::putInt)
         val packetLength = packet.capacity()
         val written = requireNotNull(bulkOut).let { endpoint ->
-            connection.bulkTransfer(endpoint, packet.array(), packetLength, USB_TIMEOUT_MS)
+            connection.bulkTransfer(endpoint, packet.array(), packetLength, timeoutMs)
         }
-        check(written == packetLength) { "佳能 PTP 命令写入失败: $written/$packetLength" }
+        if (written != packetLength) {
+            throw CanonPtpTransportException(
+                "佳能 PTP 命令写入失败 op=${operation.hex()} tx=$currentTransactionId: " +
+                    "$written/$packetLength",
+            )
+        }
+        return currentTransactionId
     }
 
-    private fun readContainer(): PtpContainer {
-        val header = readHeader()
-        check(header.length >= CONTAINER_HEADER_SIZE) { "佳能返回了无效 PTP 包长度=${header.length}" }
-        check(header.length <= MAX_CONTAINER_SIZE) { "佳能 PTP 包过大=${header.length}" }
+    private fun readContainer(
+        operation: Int,
+        expectedTransactionId: Int,
+        timeoutMs: Int,
+    ): PtpContainer {
+        val header = readHeader(timeoutMs)
+        validateHeader(header, operation, expectedTransactionId)
         val payload = ByteArray(header.length - CONTAINER_HEADER_SIZE)
-        readExactly(payload)
+        bulkReader.readExactly(payload, timeoutMs)
         return PtpContainer(header.type, header.code, payload)
     }
 
-    private fun readHeader(): PtpHeader {
+    private fun readHeader(timeoutMs: Int): PtpHeader {
         val bytes = ByteArray(CONTAINER_HEADER_SIZE)
-        readExactly(bytes)
+        bulkReader.readExactly(bytes, timeoutMs)
         val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        return PtpHeader(buffer.int, buffer.short.toInt() and 0xffff, buffer.short.toInt() and 0xffff)
+        return PtpHeader(
+            length = buffer.int,
+            type = buffer.short.toInt() and 0xffff,
+            code = buffer.short.toInt() and 0xffff,
+            transactionId = buffer.int,
+        )
     }
 
-    private fun readExactly(target: ByteArray) {
-        var offset = 0
-        val chunk = ByteArray((requireNotNull(bulkIn).maxPacketSize).coerceAtLeast(512))
-        while (offset < target.size) {
-            val wanted = minOf(chunk.size, target.size - offset)
-            val count = connection.bulkTransfer(requireNotNull(bulkIn), chunk, wanted, USB_TIMEOUT_MS)
-            check(count > 0) { "佳能 PTP 读取超时或失败: $count" }
-            System.arraycopy(chunk, 0, target, offset, count)
-            offset += count
+    private fun validateHeader(
+        header: PtpHeader,
+        operation: Int,
+        expectedTransactionId: Int,
+        allowLargeData: Boolean = false,
+    ) {
+        check(header.length >= CONTAINER_HEADER_SIZE) {
+            "佳能返回了无效 PTP 包长度=${header.length} op=${operation.hex()}"
+        }
+        if (!allowLargeData || header.type != CONTAINER_DATA) {
+            check(header.length <= MAX_CONTAINER_SIZE) {
+                "佳能 PTP 包过大=${header.length} op=${operation.hex()}"
+            }
+        }
+        check(header.transactionId == expectedTransactionId) {
+            "佳能 PTP 事务不匹配 op=${operation.hex()} " +
+                "expected=$expectedTransactionId actual=${header.transactionId}"
         }
     }
 
-    private fun copyToStream(length: Int, output: FileOutputStream) {
-        val chunk = ByteArray((requireNotNull(bulkIn).maxPacketSize * 64).coerceAtLeast(16 * 1024))
-        var remaining = length
-        while (remaining > 0) {
-            val count = connection.bulkTransfer(requireNotNull(bulkIn), chunk, minOf(chunk.size, remaining), USB_TIMEOUT_MS)
-            check(count > 0) { "佳能照片传输中断: $count" }
-            output.write(chunk, 0, count)
-            remaining -= count
-        }
-    }
-
-    private fun discard(length: Int) {
+    private fun discard(length: Int, timeoutMs: Int) {
         if (length <= 0) return
-        readExactly(ByteArray(length))
+        bulkReader.readExactly(ByteArray(length), timeoutMs)
     }
 
     private fun selectPtpInterface() {
@@ -298,11 +581,24 @@ internal class CanonPtpBackend(
         return CanonPtpProtocol.parsePhotoId(id)
     }
 
-    private fun responseName(code: Int) = "0x${code.toString(16)}"
+    private fun Int.hex() = "0x${toString(16)}"
 
-    private data class PtpHeader(val length: Int, val type: Int, val code: Int)
+    private data class PtpHeader(
+        val length: Int,
+        val type: Int,
+        val code: Int,
+        val transactionId: Int,
+    )
     private data class PtpContainer(val type: Int, val code: Int, val payload: ByteArray)
     private data class PtpResult(val data: ByteArray)
+    private data class HandleSnapshot(
+        val handlesByStorage: Map<Int, IntArray>,
+    ) {
+        val storageIds: Set<Int> = handlesByStorage.keys.toSet()
+        val allHandles: Set<Int> = buildSet {
+            handlesByStorage.values.forEach { handles -> addAll(handles.toList()) }
+        }
+    }
     private class CaptureListener(
         private val latch: CountDownLatch,
         private val callback: (CanonPtpPhoto) -> Unit,
@@ -310,15 +606,38 @@ internal class CanonPtpBackend(
 
     private val captureListeners = mutableSetOf<CaptureListener>()
 
+    private class AndroidBulkTransport(
+        private val connection: UsbDeviceConnection,
+        private val endpoint: UsbEndpoint,
+    ) : CanonPtpBulkTransport {
+        override val maxPacketSize: Int = endpoint.maxPacketSize
+
+        override fun read(buffer: ByteArray, length: Int, timeoutMs: Int): Int {
+            return connection.bulkTransfer(endpoint, buffer, length, timeoutMs)
+        }
+    }
+
     companion object {
         private const val USB_TIMEOUT_MS = 30_000
+        private const val EVENT_USB_TIMEOUT_MS = 2_500
+        private const val CLOSE_TIMEOUT_MS = 2_000
         private const val EVENT_PERIOD_MS = 700L
+        private const val EVENT_STOP_TIMEOUT_MS = 3_000L
+        private const val KEEP_ALIVE_INTERVAL_MS = 20_000L
+        private const val KEEP_ALIVE_TIMEOUT_MS = 2_500
+        private const val FULL_SCAN_MAINTENANCE_BATCH = 50
+        private const val PHOTO_INFO_MAX_ATTEMPTS = 3
+        private const val PHOTO_INFO_MAX_AGE_MS = 5_000L
+        private const val PUBLISHED_HANDLE_LIMIT = 512
         private const val MAX_CONTAINER_SIZE = 32 * 1024 * 1024
         private const val CONTAINER_HEADER_SIZE = 12
         private const val CONTAINER_COMMAND = 1
         private const val CONTAINER_DATA = 2
         private const val CONTAINER_RESPONSE = 3
         private const val RESPONSE_OK = 0x2001
+        private const val RESPONSE_OPERATION_NOT_SUPPORTED = 0x2005
+        private const val RESPONSE_INVALID_OBJECT_HANDLE = 0x2009
+        private const val RESPONSE_DEVICE_BUSY = 0x2019
         private const val OPEN_SESSION = 0x1002
         private const val CLOSE_SESSION = 0x1003
         private const val GET_STORAGE_IDS = 0x1004
@@ -329,8 +648,8 @@ internal class CanonPtpBackend(
         private const val EOS_SET_PC_CONNECT_MODE = 0x9114
         private const val EOS_SET_EVENT_MODE = 0x9115
         private const val EOS_EVENT_CHECK = 0x9116
-        private const val EOS_OBJECT_ADDED = 0xc181
-        private const val EOS_DIR_ITEM_CREATED = 0xc1a7
+        private const val EOS_KEEP_DEVICE_ON = 0x911d
+        private val PHOTO_EXTENSIONS = setOf("jpg", "jpeg", "jpe", "cr2", "cr3", "raw")
         internal const val PHOTO_ID_PREFIX = "canon-ptp:"
     }
 }
@@ -410,3 +729,10 @@ internal object CanonPtpProtocol {
         return IntArray(count) { buffer.int }
     }
 }
+
+internal class CanonPtpResponseException(
+    val operation: Int,
+    val responseCode: Int,
+) : IllegalStateException(
+    "佳能 PTP 0x${operation.toString(16)} 失败: 0x${responseCode.toString(16)}",
+)
