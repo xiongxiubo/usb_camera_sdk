@@ -142,9 +142,11 @@ class UsbCameraController extends ChangeNotifier {
       final events = await _repository.drainPhotoEvents();
       final uploadableEvents = _preferJpegPhotos(events);
       for (final photo in uploadableEvents) {
-        final exists = _photos.any((item) =>
-            item.id == photo.id ||
-            (item.folder == photo.folder && item.fileName == photo.fileName));
+        final exists = _photos.any(
+          (item) =>
+              item.id == photo.id ||
+              (item.folder == photo.folder && item.fileName == photo.fileName),
+        );
         if (!exists) {
           _photos = [photo, ..._photos];
         }
@@ -257,7 +259,8 @@ class UsbCameraController extends ChangeNotifier {
   }
 
   Future<List<UsbCameraPhoto>> resolveAddedPhoto(
-      UsbCameraPhoto eventPhoto) async {
+    UsbCameraPhoto eventPhoto,
+  ) async {
     if (!isConnected) {
       return _isJpegFileName(eventPhoto.fileName) ? [eventPhoto] : const [];
     }
@@ -619,7 +622,7 @@ class UsbCameraController extends ChangeNotifier {
           final device = UsbCameraDevice.fromMap(payload);
           _devices = [
             device,
-            ..._devices.where((item) => item.deviceName != device.deviceName)
+            ..._devices.where((item) => item.deviceName != device.deviceName),
           ];
         }
         break;
@@ -651,9 +654,12 @@ class UsbCameraController extends ChangeNotifier {
           }
           if (!_isJpegFileName(photo.fileName)) break;
           _addedPhotoController.add(photo);
-          final exists = _photos.any((item) =>
-              item.id == photo.id ||
-              (item.folder == photo.folder && item.fileName == photo.fileName));
+          final exists = _photos.any(
+            (item) =>
+                item.id == photo.id ||
+                (item.folder == photo.folder &&
+                    item.fileName == photo.fileName),
+          );
           if (!exists) {
             _photos = [photo, ..._photos];
           }
