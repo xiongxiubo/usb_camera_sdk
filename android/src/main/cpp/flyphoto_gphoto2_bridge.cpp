@@ -9,10 +9,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <fcntl.h>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -641,9 +643,20 @@ Java_com_flyphoto_usb_1camera_1sdk_GPhoto2Bridge_nativeDownload(
     const std::string folder_path = java_string(env, folder);
     const std::string file_name = java_string(env, name);
     const std::string destination = java_string(env, destination_path);
+    const int destination_fd = open(
+        destination.c_str(),
+        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+        0600);
+    if (destination_fd < 0) {
+        return make_string(env, "Unable to open destination file");
+    }
     CameraFile* file = nullptr;
-    int result = gp_file_new(&file);
-    if (result < GP_OK) return make_string(env, gp_error(result));
+    int result = gp_file_new_from_fd(&file, destination_fd);
+    if (result < GP_OK) {
+        close(destination_fd);
+        std::remove(destination.c_str());
+        return make_string(env, gp_error(result));
+    }
 
     result = gp_camera_file_get(
         g_camera,
@@ -652,9 +665,11 @@ Java_com_flyphoto_usb_1camera_1sdk_GPhoto2Bridge_nativeDownload(
         GP_FILE_TYPE_NORMAL,
         file,
         g_context);
-    if (result >= GP_OK) result = gp_file_save(file, destination.c_str());
     gp_file_unref(file);
-    if (result < GP_OK) return make_string(env, gp_error(result));
+    if (result < GP_OK) {
+        std::remove(destination.c_str());
+        return make_string(env, gp_error(result));
+    }
     return make_string(env, destination);
 }
 

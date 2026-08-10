@@ -46,6 +46,27 @@ void main() {
       expect(photo.format, 'CR3');
       expect(photo.folder, '/store_00010001/DCIM/100CANON');
       expect(photo.localPath, '/tmp/IMG_0001.cr3');
+      expect(photo.mediaType, UsbCameraMediaType.image);
+      expect(photo.isImage, isTrue);
+    });
+
+    test('classifies camera video and exposes its MIME type', () {
+      final media = UsbCameraMediaFile.fromMap({
+        'id': 'video-1',
+        'folder': '/DCIM/100CANON',
+        'fileName': 'MVI_0001.MOV',
+        'sizeMb': 256,
+        'mediaType': 'video',
+        'mimeType': 'video/quicktime',
+      });
+
+      expect(media.mediaType, UsbCameraMediaType.video);
+      expect(media.isVideo, isTrue);
+      expect(media.isSupportedMedia, isTrue);
+      expect(media.mimeType, 'video/quicktime');
+      expect(
+          usbCameraMediaTypeForFileName('clip.M2TS'), UsbCameraMediaType.video);
+      expect(usbCameraMimeTypeForFileName('clip.MP4'), 'video/mp4');
     });
   });
 }

@@ -12,6 +12,12 @@ enum CameraIngestionMode {
   manualSync,
 }
 
+enum UsbCameraMediaType {
+  image,
+  video,
+  unknown,
+}
+
 class UsbCameraCapabilities {
   const UsbCameraCapabilities({
     required this.ingestionMode,
@@ -89,7 +95,10 @@ class UsbCameraPhoto {
     required this.format,
     required this.folder,
     this.localPath,
-  });
+    UsbCameraMediaType? mediaType,
+    String? mimeType,
+  })  : _mediaType = mediaType,
+        _mimeType = mimeType;
 
   final String id;
   final String fileName;
@@ -98,6 +107,19 @@ class UsbCameraPhoto {
   final String format;
   final String folder;
   final String? localPath;
+  final UsbCameraMediaType? _mediaType;
+  final String? _mimeType;
+
+  UsbCameraMediaType get mediaType =>
+      _mediaType ?? usbCameraMediaTypeForFileName(fileName);
+
+  String get mimeType => _mimeType ?? usbCameraMimeTypeForFileName(fileName);
+
+  bool get isImage => mediaType == UsbCameraMediaType.image;
+
+  bool get isVideo => mediaType == UsbCameraMediaType.video;
+
+  bool get isSupportedMedia => mediaType != UsbCameraMediaType.unknown;
 
   factory UsbCameraPhoto.fromMap(Map<dynamic, dynamic> map) {
     final fileName = map['fileName']?.toString() ?? '';
@@ -111,9 +133,15 @@ class UsbCameraPhoto {
           (map['format']?.toString() ?? fileName.split('.').last).toUpperCase(),
       folder: folder,
       localPath: map['localPath']?.toString(),
+      mediaType: _mediaTypeValue(map['mediaType'] ?? map['media_type']),
+      mimeType: map['mimeType']?.toString() ?? map['mime_type']?.toString(),
     );
   }
 }
+
+/// Generic name for camera files. The alias keeps the original public
+/// [UsbCameraPhoto] API source-compatible for existing integrations.
+typedef UsbCameraMediaFile = UsbCameraPhoto;
 
 class CameraTransferProgress {
   const CameraTransferProgress({
@@ -135,3 +163,83 @@ int? _nullableIntValue(dynamic value) {
   if (value is String) return int.tryParse(value);
   return null;
 }
+
+UsbCameraMediaType usbCameraMediaTypeForFileName(String fileName) {
+  final extension = _fileExtension(fileName);
+  if (_imageExtensions.contains(extension)) return UsbCameraMediaType.image;
+  if (_videoExtensions.contains(extension)) return UsbCameraMediaType.video;
+  return UsbCameraMediaType.unknown;
+}
+
+String usbCameraMimeTypeForFileName(String fileName) {
+  switch (_fileExtension(fileName)) {
+    case 'jpg':
+    case 'jpeg':
+    case 'jpe':
+      return 'image/jpeg';
+    case 'dng':
+      return 'image/dng';
+    case 'mp4':
+      return 'video/mp4';
+    case 'mov':
+      return 'video/quicktime';
+    case 'm4v':
+      return 'video/x-m4v';
+    case 'avi':
+      return 'video/x-msvideo';
+    case 'mts':
+    case 'm2ts':
+      return 'video/mp2t';
+    case 'webm':
+      return 'video/webm';
+  }
+  return 'application/octet-stream';
+}
+
+UsbCameraMediaType? _mediaTypeValue(dynamic value) {
+  switch (value?.toString().trim().toLowerCase()) {
+    case 'image':
+    case 'photo':
+      return UsbCameraMediaType.image;
+    case 'video':
+      return UsbCameraMediaType.video;
+    case 'unknown':
+      return UsbCameraMediaType.unknown;
+  }
+  return null;
+}
+
+String _fileExtension(String fileName) {
+  final name = fileName.trim().toLowerCase();
+  final index = name.lastIndexOf('.');
+  if (index < 0 || index == name.length - 1) return '';
+  return name.substring(index + 1);
+}
+
+const _imageExtensions = {
+  'jpg',
+  'jpeg',
+  'jpe',
+  'arw',
+  'raw',
+  'dng',
+  'cr2',
+  'cr3',
+  'nef',
+  'raf',
+  'orf',
+  'rw2',
+  'pef',
+  'srw',
+  'x3f',
+};
+
+const _videoExtensions = {
+  'mp4',
+  'mov',
+  'm4v',
+  'avi',
+  'mts',
+  'm2ts',
+  'webm',
+};

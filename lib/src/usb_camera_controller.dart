@@ -18,10 +18,15 @@ class UsbCameraController extends ChangeNotifier {
   final UsbCameraRepository _repository;
   StreamSubscription<Map<dynamic, dynamic>>? _eventSubscription;
   final _addedPhotoController = StreamController<UsbCameraPhoto>.broadcast();
+  final _addedMediaController =
+      StreamController<UsbCameraMediaFile>.broadcast();
+  final _addedVideoController =
+      StreamController<UsbCameraMediaFile>.broadcast();
 
   var _status = CameraConnectionStatus.disconnected;
   var _devices = <UsbCameraDevice>[];
   var _photos = <UsbCameraPhoto>[];
+  var _mediaFiles = <UsbCameraMediaFile>[];
   UsbCameraDevice? _connectedDevice;
   String? _errorMessage;
   bool _isLoading = false;
@@ -31,19 +36,27 @@ class UsbCameraController extends ChangeNotifier {
   CameraConnectionStatus get status => _status;
   List<UsbCameraDevice> get devices => List.unmodifiable(_devices);
   List<UsbCameraPhoto> get photos => List.unmodifiable(_photos);
+  List<UsbCameraMediaFile> get mediaFiles => List.unmodifiable(_mediaFiles);
+  List<UsbCameraMediaFile> get videos =>
+      List.unmodifiable(_mediaFiles.where((file) => file.isVideo));
   UsbCameraDevice? get connectedDevice => _connectedDevice;
   String? get errorMessage => _errorMessage;
   bool get isLoading => _isLoading;
   bool get isConnected => _status == CameraConnectionStatus.connected;
   bool get isFailed => _status == CameraConnectionStatus.failed;
   bool get isPhotoEventListening => _eventListening;
+  bool get isMediaEventListening => _eventListening;
   UsbCameraCapabilities get capabilities =>
       _connectedDevice?.capabilities ?? UsbCameraCapabilities.eventAndPolling;
   bool get supportsAutomaticPhotoIngestion =>
       capabilities.supportsAutomaticIngestion;
+  bool get supportsAutomaticMediaIngestion =>
+      capabilities.supportsAutomaticIngestion;
   bool get isCanonConnected => _connectedDevice?.isCanon ?? false;
   String get cameraModel => _connectedDevice?.displayName ?? 'USB 相机';
   Stream<UsbCameraPhoto> get addedPhotos => _addedPhotoController.stream;
+  Stream<UsbCameraMediaFile> get addedMedia => _addedMediaController.stream;
+  Stream<UsbCameraMediaFile> get addedVideos => _addedVideoController.stream;
 
   Future<void> loadDevices() async {
     await _run(() async {
@@ -89,6 +102,7 @@ class UsbCameraController extends ChangeNotifier {
       _connectedDevice = await _repository.connect(device);
       _status = CameraConnectionStatus.connected;
       _photos = [];
+      _mediaFiles = [];
       if (isCanonConnected) {
         await appendLog(
           'camera connected: Canon shooting-first mode uses handle baseline and skips initial listPhotos',
@@ -121,6 +135,7 @@ class UsbCameraController extends ChangeNotifier {
     await stopPhotoEventListening();
     await _repository.releaseCameraControl();
     _photos = [];
+    _mediaFiles = [];
     await appendLog('camera physical shutter release control done');
     notifyListeners();
   }
@@ -130,6 +145,7 @@ class UsbCameraController extends ChangeNotifier {
     await _repository.disconnect();
     _connectedDevice = null;
     _photos = [];
+    _mediaFiles = [];
     _status = _repository.isSupported
         ? CameraConnectionStatus.disconnected
         : CameraConnectionStatus.unsupported;
@@ -149,9 +165,31 @@ class UsbCameraController extends ChangeNotifier {
         );
         if (!exists) {
           _photos = [photo, ..._photos];
+          _addMediaFileIfMissing(photo);
         }
       }
       if (uploadableEvents.isNotEmpty) notifyListeners();
+      return events;
+    } catch (error) {
+      _errorMessage = error.toString();
+      notifyListeners();
+      return const [];
+    }
+  }
+
+  Future<List<UsbCameraMediaFile>> drainMediaEvents() async {
+    if (!isConnected) return const [];
+    try {
+      final events = await _repository.drainMediaEvents();
+      final uploadableEvents = _preferUploadableMedia(events);
+      var changed = false;
+      for (final file in uploadableEvents) {
+        changed = _addMediaFileIfMissing(file) || changed;
+      }
+      if (changed) {
+        _photos = _mediaFiles.where((file) => file.isImage).toList();
+        notifyListeners();
+      }
       return events;
     } catch (error) {
       _errorMessage = error.toString();
@@ -173,6 +211,26 @@ class UsbCameraController extends ChangeNotifier {
       _eventListening = true;
     } on PlatformException catch (error) {
       _errorMessage = error.message ?? '相机事件监听启动失败';
+      notifyListeners();
+    } catch (error) {
+      _errorMessage = error.toString();
+      notifyListeners();
+    }
+  }
+
+  Future<void> startMediaEventListening() async {
+    if (!isConnected) return;
+    if (!supportsAutomaticMediaIngestion) {
+      await appendLog(
+        'media event listening skipped: manual sync ingestion mode',
+      );
+      return;
+    }
+    try {
+      await _repository.startMediaEventListening();
+      _eventListening = true;
+    } on PlatformException catch (error) {
+      _errorMessage = error.message ?? '相机媒体事件监听启动失败';
       notifyListeners();
     } catch (error) {
       _errorMessage = error.toString();
@@ -211,6 +269,15 @@ class UsbCameraController extends ChangeNotifier {
     }
   }
 
+  Future<void> stopMediaEventListening() async {
+    try {
+      await _repository.stopMediaEventListening();
+      _eventListening = false;
+    } catch (_) {
+      // The native listener is best-effort cleanup during disconnect/dispose.
+    }
+  }
+
   Future<void> appendLog(String message) async {
     try {
       await _repository.appendCameraLog(message);
@@ -222,33 +289,41 @@ class UsbCameraController extends ChangeNotifier {
   Future<void> refreshPhotos() async {
     if (!isConnected) return;
     await _run(() async {
-      _photos = _preferJpegPhotos(await _repository.listPhotos());
+      _replaceMediaFiles(await _repository.listMedia());
     });
   }
 
+  Future<void> refreshMedia() => refreshPhotos();
+
   Future<List<UsbCameraPhoto>> refreshPhotosIncremental() async {
+    final media = await refreshMediaIncremental();
+    return media.where((file) => file.isImage).toList();
+  }
+
+  Future<List<UsbCameraMediaFile>> refreshMediaIncremental() async {
     if (!isConnected) return const [];
     try {
-      final currentKeys = _photos.map(_photoPairKey).toSet();
-      final latest = _preferJpegPhotos(await _repository.listNewPhotos());
+      final currentKeys = _mediaFiles.map(_mediaIdentityKey).toSet();
+      final latest = _preferUploadableMedia(await _repository.listNewMedia());
       final fresh = latest
-          .where((photo) => !currentKeys.contains(_photoPairKey(photo)))
+          .where((file) => !currentKeys.contains(_mediaIdentityKey(file)))
           .toList();
-      if (fresh.isNotEmpty) {
-        _photos = [
+      if (latest.isNotEmpty) {
+        _mediaFiles = [
           ...fresh,
-          for (final photo in _photos)
+          for (final file in _mediaFiles)
             latest.firstWhere(
-              (item) => _photoPairKey(item) == _photoPairKey(photo),
-              orElse: () => photo,
+              (item) => _mediaIdentityKey(item) == _mediaIdentityKey(file),
+              orElse: () => file,
             ),
         ];
         final seen = <String>{};
-        _photos = [
-          for (final photo in _photos)
-            if (seen.add(_photoPairKey(photo))) photo,
+        _mediaFiles = [
+          for (final file in _mediaFiles)
+            if (seen.add(_mediaIdentityKey(file))) file,
         ];
-        notifyListeners();
+        _photos = _mediaFiles.where((file) => file.isImage).toList();
+        if (fresh.isNotEmpty) notifyListeners();
       }
       return fresh;
     } catch (error) {
@@ -339,6 +414,23 @@ class UsbCameraController extends ChangeNotifier {
     return fallback;
   }
 
+  Future<List<UsbCameraMediaFile>> resolveAddedMedia(
+    UsbCameraMediaFile eventFile,
+  ) async {
+    if (!eventFile.isVideo) return resolveAddedPhoto(eventFile);
+    if (!isConnected) return [eventFile];
+
+    await refreshMediaIncremental();
+    for (final file in _mediaFiles) {
+      if (file.id == eventFile.id ||
+          (file.folder == eventFile.folder &&
+              file.fileName == eventFile.fileName)) {
+        return [file];
+      }
+    }
+    return [eventFile];
+  }
+
   Future<String?> captureAndDownload() async {
     if (!isConnected || _captureInFlight) return null;
     _captureInFlight = true;
@@ -375,7 +467,10 @@ class UsbCameraController extends ChangeNotifier {
         capturedPhoto ??= _findFirstNewPhoto(beforeKeys, latest);
         if (capturedPhoto != null) break;
       }
-      _photos = latest;
+      _replaceMediaFiles([
+        ..._mediaFiles.where((file) => file.isVideo),
+        ...latest,
+      ]);
       notifyListeners();
 
       if (capturedPhoto == null) {
@@ -406,6 +501,9 @@ class UsbCameraController extends ChangeNotifier {
   bool isRawPhotoName(String fileName) => _isRawFileName(fileName);
 
   bool isJpegPhotoName(String fileName) => _isJpegFileName(fileName);
+
+  bool isVideoName(String fileName) =>
+      usbCameraMediaTypeForFileName(fileName) == UsbCameraMediaType.video;
 
   UsbCameraPhoto? findJpegCompanionFor(UsbCameraPhoto photo) {
     return _findJpegCompanion(photo, _photos);
@@ -495,6 +593,44 @@ class UsbCameraController extends ChangeNotifier {
             seen.add(_photoPairKey(photo)))
           photo,
     ];
+  }
+
+  List<UsbCameraMediaFile> _preferUploadableMedia(
+    List<UsbCameraMediaFile> files,
+  ) {
+    final preferredPhotos = _preferJpegPhotos(files);
+    final preferredPhotoByKey = {
+      for (final photo in preferredPhotos) _photoPairKey(photo): photo,
+    };
+    final seen = <String>{};
+    return [
+      for (final file in files)
+        if ((file.isVideo ||
+                identical(preferredPhotoByKey[_photoPairKey(file)], file)) &&
+            seen.add(_mediaIdentityKey(file)))
+          file,
+    ];
+  }
+
+  void _replaceMediaFiles(List<UsbCameraMediaFile> files) {
+    _mediaFiles = _preferUploadableMedia(files);
+    _photos = _mediaFiles.where((file) => file.isImage).toList();
+  }
+
+  bool _addMediaFileIfMissing(UsbCameraMediaFile file) {
+    final exists = _mediaFiles.any(
+      (item) =>
+          item.id == file.id ||
+          _mediaIdentityKey(item) == _mediaIdentityKey(file),
+    );
+    if (exists) return false;
+    _mediaFiles = [file, ..._mediaFiles];
+    return true;
+  }
+
+  String _mediaIdentityKey(UsbCameraMediaFile file) {
+    return '${file.folder.trim().toLowerCase()}/${file.fileName.trim().toLowerCase()}'
+        .replaceAll('//', '/');
   }
 
   UsbCameraPhoto? _findJpegCompanion(
@@ -595,6 +731,22 @@ class UsbCameraController extends ChangeNotifier {
     }
   }
 
+  Future<String?> downloadMedia(UsbCameraMediaFile media) async {
+    if (!media.isSupportedMedia) {
+      _errorMessage = '不支持的相机文件格式';
+      notifyListeners();
+      return null;
+    }
+    if (media.isImage) return downloadPhoto(media);
+    try {
+      return await _repository.downloadMedia(media);
+    } catch (error) {
+      _errorMessage = error.toString();
+      notifyListeners();
+      return null;
+    }
+  }
+
   Future<void> _run(Future<void> Function() action) async {
     _isLoading = true;
     _errorMessage = null;
@@ -635,6 +787,7 @@ class UsbCameraController extends ChangeNotifier {
           if (_connectedDevice?.deviceName == device.deviceName) {
             _connectedDevice = null;
             _photos = [];
+            _mediaFiles = [];
             _status = CameraConnectionStatus.disconnected;
           }
         }
@@ -646,28 +799,15 @@ class UsbCameraController extends ChangeNotifier {
         }
         break;
       case 'photoAdded':
+      case 'mediaAdded':
         if (payload is Map<dynamic, dynamic>) {
-          final photo = UsbCameraPhoto.fromMap(payload);
-          if (_isRawFileName(photo.fileName)) {
-            _addedPhotoController.add(photo);
-            break;
-          }
-          if (!_isJpegFileName(photo.fileName)) break;
-          _addedPhotoController.add(photo);
-          final exists = _photos.any(
-            (item) =>
-                item.id == photo.id ||
-                (item.folder == photo.folder &&
-                    item.fileName == photo.fileName),
-          );
-          if (!exists) {
-            _photos = [photo, ..._photos];
-          }
+          _handleAddedNativeMedia(UsbCameraPhoto.fromMap(payload));
         }
         break;
       case 'disconnected':
         _connectedDevice = null;
         _photos = [];
+        _mediaFiles = [];
         _status = CameraConnectionStatus.disconnected;
         break;
       case 'permissionDenied':
@@ -678,11 +818,32 @@ class UsbCameraController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void _handleAddedNativeMedia(UsbCameraMediaFile file) {
+    if (!file.isSupportedMedia) return;
+    _addedMediaController.add(file);
+    if (file.isVideo) {
+      _addedVideoController.add(file);
+      _addMediaFileIfMissing(file);
+      return;
+    }
+    if (_isRawFileName(file.fileName)) {
+      _addedPhotoController.add(file);
+      return;
+    }
+    if (!_isJpegFileName(file.fileName)) return;
+    _addedPhotoController.add(file);
+    if (_addMediaFileIfMissing(file)) {
+      _photos = [file, ..._photos];
+    }
+  }
+
   @override
   void dispose() {
     unawaited(stopPhotoEventListening());
     _eventSubscription?.cancel();
     _addedPhotoController.close();
+    _addedMediaController.close();
+    _addedVideoController.close();
     super.dispose();
   }
 }

@@ -46,8 +46,24 @@ void main() {
               'shotAt': '10:00:00',
             }
           ];
+        case 'listMedia':
+        case 'listNewMedia':
+          return [
+            {
+              'id': 'v1',
+              'folder': '/DCIM',
+              'fileName': 'VID_1.MP4',
+              'sizeMb': 80,
+              'format': 'MP4',
+              'mediaType': 'video',
+              'mimeType': 'video/mp4',
+              'shotAt': '10:01:00',
+            }
+          ];
         case 'downloadPhoto':
           return '/cache/IMG_1.JPG';
+        case 'downloadMedia':
+          return '/cache/VID_1.MP4';
       }
       return null;
     });
@@ -59,6 +75,9 @@ void main() {
     final photos = await repository.listPhotos();
     final newPhotos = await repository.listNewPhotos();
     final downloadedPath = await repository.downloadPhoto(photos.first);
+    final media = await repository.listMedia();
+    final newMedia = await repository.listNewMedia();
+    final downloadedMediaPath = await repository.downloadMedia(media.first);
 
     expect(devices.single.displayName, 'Test Camera');
     expect(granted, isTrue);
@@ -66,6 +85,9 @@ void main() {
     expect(photos.single.fileName, 'IMG_1.JPG');
     expect(newPhotos.single.fileName, 'IMG_1.JPG');
     expect(downloadedPath, '/cache/IMG_1.JPG');
+    expect(media.single.isVideo, isTrue);
+    expect(newMedia.single.mimeType, 'video/mp4');
+    expect(downloadedMediaPath, '/cache/VID_1.MP4');
     expect(calls.map((call) => call.method), [
       'listDevices',
       'requestPermission',
@@ -73,12 +95,20 @@ void main() {
       'listPhotos',
       'listNewPhotos',
       'downloadPhoto',
+      'listMedia',
+      'listNewMedia',
+      'downloadMedia',
     ]);
     expect(calls[1].arguments, {'deviceName': 'camera-1'});
     expect(calls[5].arguments, {
       'id': 'p1',
       'folder': '/',
       'name': 'IMG_1.JPG',
+    });
+    expect(calls[8].arguments, {
+      'id': 'v1',
+      'folder': '/DCIM',
+      'name': 'VID_1.MP4',
     });
 
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger

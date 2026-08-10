@@ -162,11 +162,21 @@ class UsbCameraSdkPlugin :
             "listPhotos" -> cameraDispatcher.execute {
                 mainResult.success(listPhotos(call.argument<String>("folder") ?: "/"))
             }
+            "listMedia" -> cameraDispatcher.execute {
+                mainResult.success(listMedia(call.argument<String>("folder") ?: "/"))
+            }
             "listNewPhotos" -> cameraDispatcher.execute {
                 mainResult.success(listNewPhotos(call.argument<String>("folder") ?: "/"))
             }
+            "listNewMedia" -> cameraDispatcher.execute {
+                mainResult.success(listNewMedia(call.argument<String>("folder") ?: "/"))
+            }
             "drainPhotoEvents" -> result.success(drainPhotoEvents())
+            "drainMediaEvents" -> result.success(drainMediaEvents())
             "startPhotoEventListening" -> {
+                cameraDispatcher.execute { startPhotoEventListening(mainResult) }
+            }
+            "startMediaEventListening" -> {
                 cameraDispatcher.execute { startPhotoEventListening(mainResult) }
             }
             "stopPhotoEventListening" -> {
@@ -176,7 +186,22 @@ class UsbCameraSdkPlugin :
                     mainResult.success(null)
                 }
             }
+            "stopMediaEventListening" -> {
+                photoEventListening.set(false)
+                cameraDispatcher.execute {
+                    stopPhotoEventListening()
+                    mainResult.success(null)
+                }
+            }
             "downloadPhoto" -> cameraDispatcher.execute {
+                downloadPhoto(
+                    folder = call.argument<String>("folder") ?: "/",
+                    name = call.argument<String>("name"),
+                    id = call.argument<String>("id"),
+                    result = mainResult,
+                )
+            }
+            "downloadMedia" -> cameraDispatcher.execute {
                 downloadPhoto(
                     folder = call.argument<String>("folder") ?: "/",
                     name = call.argument<String>("name"),
@@ -444,10 +469,10 @@ class UsbCameraSdkPlugin :
         )
     }
 
-    private fun listPhotos(folder: String): List<Map<String, Any?>> {
+    private fun listMedia(folder: String): List<Map<String, Any?>> {
         canonPtpBackend?.let { backend ->
             return runCatching { backend.listPhotos() }
-                .onFailure { error -> appendCameraLog("canon_ptp listPhotos failed: ${error.message}") }
+                .onFailure { error -> appendCameraLog("canon_ptp listMedia failed: ${error.message}") }
                 .getOrDefault(emptyList())
                 .map { photo -> photo.toMap() }
         }
@@ -462,21 +487,37 @@ class UsbCameraSdkPlugin :
                 "sizeMb" to (parts.getOrNull(2)?.toIntOrNull() ?: 0),
                 "format" to (parts.getOrNull(3) ?: parts.getOrNull(1)?.substringAfterLast('.', "JPG") ?: "JPG"),
                 "shotAt" to (parts.getOrNull(4) ?: "--:--:--"),
+                "mediaType" to mediaTypeForFileName(parts.getOrNull(1) ?: encoded),
+                "mimeType" to mimeTypeForFileName(parts.getOrNull(1) ?: encoded),
             )
         }
     }
 
-    private fun listNewPhotos(folder: String): List<Map<String, Any?>> {
+    private fun listPhotos(folder: String): List<Map<String, Any?>> =
+        listMedia(folder).filter { it["mediaType"] == "image" }
+
+    private fun listNewMedia(folder: String): List<Map<String, Any?>> {
         canonPtpBackend?.let { backend ->
             return runCatching { backend.listNewPhotos() }
-                .onFailure { error -> appendCameraLog("canon_ptp listNewPhotos failed: ${error.message}") }
+                .onFailure { error -> appendCameraLog("canon_ptp listNewMedia failed: ${error.message}") }
                 .getOrDefault(emptyList())
                 .map { photo -> photo.toMap() }
         }
-        return listPhotos(folder)
+        return listMedia(folder)
     }
 
+    private fun listNewPhotos(folder: String): List<Map<String, Any?>> =
+        listNewMedia(folder).filter { it["mediaType"] == "image" }
+
     private fun drainPhotoEvents(): List<Map<String, Any?>> {
+        return synchronized(pendingPhotoEventLock) {
+            val events = pendingPhotoEvents.filter { it["mediaType"] == "image" }
+            pendingPhotoEvents.clear()
+            events
+        }
+    }
+
+    private fun drainMediaEvents(): List<Map<String, Any?>> {
         return synchronized(pendingPhotoEventLock) {
             val events = pendingPhotoEvents.toList()
             pendingPhotoEvents.clear()
@@ -551,13 +592,17 @@ class UsbCameraSdkPlugin :
                 val parts = event.split("|", limit = 3)
                 val folder = parts.getOrNull(1)?.ifBlank { "/" } ?: "/"
                 val name = parts.getOrNull(2).orEmpty()
-                appendCameraLog("photo event fileAdded folder=$folder name=$name")
+                appendCameraLog("media event fileAdded folder=$folder name=$name")
                 if (name.isBlank()) return
-                val payload = photoPayload(folder, name)
+                val payload = mediaPayload(folder, name)
+                if (payload["mediaType"] == "unknown") return
                 synchronized(pendingPhotoEventLock) {
                     pendingPhotoEvents.add(payload)
                 }
-                emitEvent("photoAdded", payload)
+                emitEvent(
+                    if (payload["mediaType"] == "video") "mediaAdded" else "photoAdded",
+                    payload,
+                )
             }
             event.startsWith("folderAdded|") -> appendCameraLog("photo event $event")
             event.startsWith("error|") -> {
@@ -570,7 +615,7 @@ class UsbCameraSdkPlugin :
         }
     }
 
-    private fun photoPayload(folder: String, name: String): Map<String, Any?> {
+    private fun mediaPayload(folder: String, name: String): Map<String, Any?> {
         val format = name.substringAfterLast('.', "JPG").uppercase()
         return mapOf(
             "id" to "$folder|$name|0|$format|--:--:--",
@@ -579,12 +624,14 @@ class UsbCameraSdkPlugin :
             "sizeMb" to 0,
             "format" to format,
             "shotAt" to "--:--:--",
+            "mediaType" to mediaTypeForFileName(name),
+            "mimeType" to mimeTypeForFileName(name),
         )
     }
 
     private fun downloadPhoto(folder: String, name: String?, id: String?, result: MethodChannel.Result) {
         if (name.isNullOrBlank()) {
-            result.error("invalid_argument", "缺少照片文件名", null)
+            result.error("invalid_argument", "缺少媒体文件名", null)
             return
         }
         val downloads = File(applicationContext.cacheDir, "camera-downloads").apply { mkdirs() }
@@ -597,12 +644,12 @@ class UsbCameraSdkPlugin :
         val destination = File(downloads, destinationName)
         val path = canonBackend?.let { backend ->
             val photoId = id ?: run {
-                result.error("invalid_argument", "缺少佳能照片 ID", null)
+                result.error("invalid_argument", "缺少佳能媒体 ID", null)
                 return
             }
             runCatching { backend.download(photoId, destination) }
                 .getOrElse { error ->
-                    result.error("download_failed", error.message ?: "佳能照片下载失败", null)
+                    result.error("download_failed", error.message ?: "佳能媒体下载失败", null)
                     return
                 }
         } ?: run {
@@ -613,13 +660,13 @@ class UsbCameraSdkPlugin :
             }
             if (nativePath != temporary.absolutePath || !temporary.isFile) {
                 temporary.delete()
-                result.error("download_failed", nativePath.ifBlank { "相机照片下载失败" }, null)
+                result.error("download_failed", nativePath.ifBlank { "相机媒体下载失败" }, null)
                 return
             }
             runCatching { destination.delete() }
             if (!temporary.renameTo(destination)) {
                 temporary.delete()
-                result.error("download_failed", "无法完成照片文件写入", null)
+                result.error("download_failed", "无法完成媒体文件写入", null)
                 return
             }
             destination.absolutePath
@@ -654,7 +701,10 @@ class UsbCameraSdkPlugin :
         if (!photoEventListening.get()) return
         val payload = photo.toMap()
         synchronized(pendingPhotoEventLock) { pendingPhotoEvents.add(payload) }
-        emitEvent("photoAdded", payload)
+        emitEvent(
+            if (payload["mediaType"] == "video") "mediaAdded" else "photoAdded",
+            payload,
+        )
     }
 
     private fun CanonPtpPhoto.toMap(): Map<String, Any?> = mapOf(
@@ -664,7 +714,31 @@ class UsbCameraSdkPlugin :
         "sizeMb" to sizeMb,
         "format" to format,
         "shotAt" to shotAt,
+        "mediaType" to mediaTypeForFileName(fileName),
+        "mimeType" to mimeTypeForFileName(fileName),
     )
+
+    private fun mediaTypeForFileName(fileName: String): String {
+        return when (fileName.substringAfterLast('.', "").lowercase()) {
+            in IMAGE_EXTENSIONS -> "image"
+            in VIDEO_EXTENSIONS -> "video"
+            else -> "unknown"
+        }
+    }
+
+    private fun mimeTypeForFileName(fileName: String): String {
+        return when (fileName.substringAfterLast('.', "").lowercase()) {
+            "jpg", "jpeg", "jpe" -> "image/jpeg"
+            "dng" -> "image/dng"
+            "mp4" -> "video/mp4"
+            "mov" -> "video/quicktime"
+            "m4v" -> "video/x-m4v"
+            "avi" -> "video/x-msvideo"
+            "mts", "m2ts" -> "video/mp2t"
+            "webm" -> "video/webm"
+            else -> "application/octet-stream"
+        }
+    }
 
     private fun findDevice(deviceName: String?): UsbDevice? {
         val devices = usbManager?.deviceList?.values.orEmpty()
@@ -825,3 +899,12 @@ class UsbCameraSdkPlugin :
         )
     }
 }
+
+private val IMAGE_EXTENSIONS = setOf(
+    "jpg", "jpeg", "jpe", "arw", "raw", "dng", "cr2", "cr3", "nef", "raf",
+    "orf", "rw2", "pef", "srw", "x3f",
+)
+
+private val VIDEO_EXTENSIONS = setOf(
+    "mp4", "mov", "m4v", "avi", "mts", "m2ts", "webm",
+)

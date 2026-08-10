@@ -89,6 +89,19 @@ class UsbCameraRepository {
         .toList();
   }
 
+  Future<List<UsbCameraMediaFile>> listMedia({String folder = '/'}) async {
+    if (!isSupported) return const [];
+    final result = await _methodChannel.invokeListMethod<dynamic>(
+      'listMedia',
+      {'folder': folder},
+    );
+    return (result ?? const [])
+        .whereType<Map<dynamic, dynamic>>()
+        .map(UsbCameraPhoto.fromMap)
+        .where((file) => file.isSupportedMedia)
+        .toList();
+  }
+
   Future<List<UsbCameraPhoto>> listNewPhotos({String folder = '/'}) async {
     if (!isSupported) return const [];
     final result = await _methodChannel.invokeListMethod<dynamic>(
@@ -98,6 +111,19 @@ class UsbCameraRepository {
     return (result ?? const [])
         .whereType<Map<dynamic, dynamic>>()
         .map(UsbCameraPhoto.fromMap)
+        .toList();
+  }
+
+  Future<List<UsbCameraMediaFile>> listNewMedia({String folder = '/'}) async {
+    if (!isSupported) return const [];
+    final result = await _methodChannel.invokeListMethod<dynamic>(
+      'listNewMedia',
+      {'folder': folder},
+    );
+    return (result ?? const [])
+        .whereType<Map<dynamic, dynamic>>()
+        .map(UsbCameraPhoto.fromMap)
+        .where((file) => file.isSupportedMedia)
         .toList();
   }
 
@@ -112,14 +138,36 @@ class UsbCameraRepository {
         .toList();
   }
 
+  Future<List<UsbCameraMediaFile>> drainMediaEvents() async {
+    if (!isSupported) return const [];
+    final result = await _methodChannel.invokeListMethod<dynamic>(
+      'drainMediaEvents',
+    );
+    return (result ?? const [])
+        .whereType<Map<dynamic, dynamic>>()
+        .map(UsbCameraPhoto.fromMap)
+        .where((file) => file.isSupportedMedia)
+        .toList();
+  }
+
   Future<void> startPhotoEventListening() async {
     if (!isSupported) return;
     await _methodChannel.invokeMethod<void>('startPhotoEventListening');
   }
 
+  Future<void> startMediaEventListening() async {
+    if (!isSupported) return;
+    await _methodChannel.invokeMethod<void>('startMediaEventListening');
+  }
+
   Future<void> stopPhotoEventListening() async {
     if (!isSupported) return;
     await _methodChannel.invokeMethod<void>('stopPhotoEventListening');
+  }
+
+  Future<void> stopMediaEventListening() async {
+    if (!isSupported) return;
+    await _methodChannel.invokeMethod<void>('stopMediaEventListening');
   }
 
   Future<void> appendCameraLog(String message) async {
@@ -136,6 +184,17 @@ class UsbCameraRepository {
           'id': photo.id,
           'folder': photo.folder,
           'name': photo.fileName,
+        }) ??
+        '';
+  }
+
+  Future<String> downloadMedia(UsbCameraMediaFile media) async {
+    if (!isSupported)
+      throw const UsbCameraException('unsupported', '当前平台不支持 USB 相机');
+    return await _methodChannel.invokeMethod<String>('downloadMedia', {
+          'id': media.id,
+          'folder': media.folder,
+          'name': media.fileName,
         }) ??
         '';
   }

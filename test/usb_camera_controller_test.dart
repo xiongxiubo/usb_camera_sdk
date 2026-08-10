@@ -52,7 +52,19 @@ class FakeUsbCameraRepository extends UsbCameraRepository {
   }
 
   @override
+  Future<List<UsbCameraMediaFile>> listMedia({String folder = '/'}) async {
+    listPhotosCalls += 1;
+    return photos;
+  }
+
+  @override
   Future<List<UsbCameraPhoto>> listNewPhotos({String folder = '/'}) async {
+    listNewPhotosCalls += 1;
+    return photos;
+  }
+
+  @override
+  Future<List<UsbCameraMediaFile>> listNewMedia({String folder = '/'}) async {
     listNewPhotosCalls += 1;
     return photos;
   }
@@ -67,7 +79,16 @@ class FakeUsbCameraRepository extends UsbCameraRepository {
   Future<String> downloadPhoto(UsbCameraPhoto photo) async => downloadResult;
 
   @override
+  Future<String> downloadMedia(UsbCameraMediaFile media) async =>
+      downloadResult;
+
+  @override
   Future<void> startPhotoEventListening() async {
+    startPhotoEventListeningCalls += 1;
+  }
+
+  @override
+  Future<void> startMediaEventListening() async {
     startPhotoEventListeningCalls += 1;
   }
 
@@ -75,10 +96,16 @@ class FakeUsbCameraRepository extends UsbCameraRepository {
   Future<void> stopPhotoEventListening() async {}
 
   @override
+  Future<void> stopMediaEventListening() async {}
+
+  @override
   Future<void> appendCameraLog(String message) async {}
 
   @override
   Future<List<UsbCameraPhoto>> drainPhotoEvents() async => const [];
+
+  @override
+  Future<List<UsbCameraMediaFile>> drainMediaEvents() async => const [];
 
   void emit(Map<dynamic, dynamic> event) => _events.add(event);
 
@@ -294,6 +321,66 @@ void main() {
     expect((await added).id, 'p2');
     expect(controller.photos.map((item) => item.id), ['p2', 'p1']);
     expect(repository.listPhotosCalls, listCallsBeforeEvent);
+  });
+
+  test('video media is listed, emitted, and downloaded without entering photos',
+      () async {
+    final repository = FakeUsbCameraRepository(
+      devices: const [device],
+      photos: [
+        photo('p1', 'IMG_1.JPG'),
+        photo('v1', 'VID_1.MP4', format: 'MP4'),
+      ],
+    )..downloadResult = '/cache/VID_2.MOV';
+    addTearDown(repository.close);
+    final controller = UsbCameraController(repository: repository);
+    addTearDown(controller.dispose);
+    await controller.connectFirstAvailable();
+
+    expect(controller.photos.map((item) => item.fileName), ['IMG_1.JPG']);
+    expect(
+      controller.mediaFiles.map((item) => item.fileName),
+      ['IMG_1.JPG', 'VID_1.MP4'],
+    );
+    expect(controller.videos.single.mimeType, 'video/mp4');
+
+    final addedMedia = controller.addedMedia.first;
+    final addedVideo = controller.addedVideos.first;
+    repository.emit({
+      'type': 'mediaAdded',
+      'payload': {
+        'id': 'v2',
+        'folder': '/DCIM',
+        'fileName': 'VID_2.MOV',
+        'shotAt': '10:02:00',
+        'sizeMb': 120,
+        'format': 'MOV',
+        'mediaType': 'video',
+        'mimeType': 'video/quicktime',
+      },
+    });
+
+    final media = await addedMedia;
+    expect((await addedVideo).id, 'v2');
+    expect(media.isVideo, isTrue);
+    expect(controller.photos, hasLength(1));
+    expect(controller.videos.map((item) => item.id), ['v2', 'v1']);
+
+    repository.photos = [
+      photo('p1', 'IMG_1.JPG'),
+      photo('v1', 'VID_1.MP4', format: 'MP4'),
+      const UsbCameraPhoto(
+        id: 'v2',
+        fileName: 'VID_2.MOV',
+        shotAt: '10:02:00',
+        sizeMb: 121,
+        format: 'MOV',
+        folder: '/DCIM',
+      ),
+    ];
+    final resolved = await controller.resolveAddedMedia(media);
+    expect(resolved.single.sizeMb, 121);
+    expect(await controller.downloadMedia(resolved.single), '/cache/VID_2.MOV');
   });
 
   test('burst JPEG events are delivered and de-duplicated without scans',

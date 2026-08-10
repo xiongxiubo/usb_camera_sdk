@@ -649,7 +649,10 @@ internal class CanonPtpBackend(
         private const val EOS_SET_EVENT_MODE = 0x9115
         private const val EOS_EVENT_CHECK = 0x9116
         private const val EOS_KEEP_DEVICE_ON = 0x911d
-        private val PHOTO_EXTENSIONS = setOf("jpg", "jpeg", "jpe", "cr2", "cr3", "raw")
+        private val PHOTO_EXTENSIONS = setOf(
+            "jpg", "jpeg", "jpe", "cr2", "cr3", "raw",
+            "mp4", "mov", "m4v", "avi", "mts", "m2ts", "webm",
+        )
         internal const val PHOTO_ID_PREFIX = "canon-ptp:"
     }
 }
@@ -671,7 +674,10 @@ private data class CanonPtpObjectInfo(
     val fileName: String,
     val captureDate: String,
 ) {
-    val isPhoto get() = fileName.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "jpe", "cr2", "cr3", "raw")
+    val isPhoto get() = fileName.substringAfterLast('.', "").lowercase() in setOf(
+        "jpg", "jpeg", "jpe", "cr2", "cr3", "raw",
+        "mp4", "mov", "m4v", "avi", "mts", "m2ts", "webm",
+    )
 
     fun toPhoto(handle: Int): CanonPtpPhoto {
         val extension = fileName.substringAfterLast('.', "JPG").uppercase()
