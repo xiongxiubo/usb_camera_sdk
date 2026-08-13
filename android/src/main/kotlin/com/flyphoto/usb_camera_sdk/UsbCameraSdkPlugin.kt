@@ -48,6 +48,8 @@ class UsbCameraSdkPlugin :
     private val cameraOperationLock = Any()
     private val pendingMediaEvents = mutableListOf<Map<String, Any?>>()
     private val mediaEventPollScheduled = AtomicBoolean(false)
+    private val genericMediaCatalog = mutableSetOf<String>()
+    private var lastGenericMediaPollAtMs = 0L
     private var eventSink: EventChannel.EventSink? = null
     private var pendingPermissionResult: MethodChannel.Result? = null
     @Volatile
@@ -323,6 +325,8 @@ class UsbCameraSdkPlugin :
         appendCameraLog("openDevice ok fd=${connection.fileDescriptor}")
 
         disconnectCamera()
+        genericMediaCatalog.clear()
+        lastGenericMediaPollAtMs = 0L
         activeConnection = connection
         activeDevice = device
 
@@ -563,6 +567,10 @@ class UsbCameraSdkPlugin :
             }
             return
         }
+        runCatching { seedGenericMediaCatalog() }
+            .onFailure { error ->
+                appendCameraLog("generic media catalog baseline failed: ${error.message}")
+            }
         scheduleMediaEventPoll()
     }
 
@@ -582,6 +590,15 @@ class UsbCameraSdkPlugin :
                 bridge.nativeWaitForEvent(250)
             }
             if (mediaEventListening.get()) handleMediaEventResult(event)
+            if (mediaEventListening.get() && canonPtpBackend == null &&
+                System.currentTimeMillis() - lastGenericMediaPollAtMs >= GENERIC_MEDIA_POLL_INTERVAL_MS
+            ) {
+                runCatching { pollGenericMediaCatalog() }
+                    .onFailure { error ->
+                        appendCameraLog("generic media catalog poll failed: ${error.message}")
+                    }
+                lastGenericMediaPollAtMs = System.currentTimeMillis()
+            }
             // Re-submit instead of looping while holding/reacquiring the lock. Any
             // foreground list/download request already queued runs before this poll.
             scheduleMediaEventPoll()
@@ -606,13 +623,7 @@ class UsbCameraSdkPlugin :
                     appendCameraLog("media event ignored unknown file=$name folder=$folder")
                     return
                 }
-                synchronized(pendingMediaEventLock) {
-                    pendingMediaEvents.add(payload)
-                }
-                emitEvent(
-                    if (payload["mediaType"] == "video") "mediaAdded" else "photoAdded",
-                    payload,
-                )
+                publishGenericMedia(payload)
             }
             event.startsWith("folderAdded|") -> appendCameraLog("media event $event")
             event.startsWith("error|") -> {
@@ -637,6 +648,71 @@ class UsbCameraSdkPlugin :
             "mediaType" to mediaTypeForFileName(name),
             "mimeType" to mimeTypeForFileName(name),
         )
+    }
+
+    private fun seedGenericMediaCatalog() {
+        val files = synchronized(cameraOperationLock) {
+            bridge.nativeListFiles("/").toList()
+        }
+        val keys = files.mapNotNull { encodedMediaKey(it) }.toSet()
+        genericMediaCatalog.clear()
+        genericMediaCatalog.addAll(keys)
+        lastGenericMediaPollAtMs = System.currentTimeMillis()
+        appendCameraLog("generic media catalog baseline files=${files.size} supported=${keys.size}")
+    }
+
+    private fun pollGenericMediaCatalog() {
+        val files = synchronized(cameraOperationLock) {
+            bridge.nativeListFiles("/").toList()
+        }
+        var discovered = 0
+        files.forEach { encoded ->
+            val parts = encoded.split("|", limit = 3)
+            val folder = parts.getOrNull(0)?.ifBlank { "/" } ?: "/"
+            val name = parts.getOrNull(1).orEmpty()
+            if (name.isBlank()) return@forEach
+            val mediaType = mediaTypeForFileName(name)
+            if (mediaType == "unknown") return@forEach
+            val key = genericMediaKey(folder, name)
+            if (genericMediaCatalog.contains(key)) return@forEach
+            val payload = mediaPayload(folder, name)
+            publishGenericMedia(payload)
+            if (genericMediaCatalog.contains(key)) discovered += 1
+        }
+        if (discovered > 0) {
+            appendCameraLog("generic media catalog discovered files=$discovered")
+        }
+    }
+
+    private fun publishGenericMedia(payload: Map<String, Any?>) {
+        val folder = payload["folder"]?.toString().orEmpty()
+        val name = payload["fileName"]?.toString().orEmpty()
+        if (name.isBlank() || payload["mediaType"] == "unknown") return
+        if (!genericMediaCatalog.add(genericMediaKey(folder, name))) return
+        synchronized(pendingMediaEventLock) {
+            pendingMediaEvents.add(payload)
+        }
+        appendCameraLog(
+            "generic media added folder=$folder name=$name " +
+                "type=${payload["mediaType"]}",
+        )
+        emitEvent(
+            if (payload["mediaType"] == "video") "mediaAdded" else "photoAdded",
+            payload,
+        )
+    }
+
+    private fun encodedMediaKey(encoded: String): String? {
+        val parts = encoded.split("|", limit = 3)
+        val folder = parts.getOrNull(0)?.ifBlank { "/" } ?: "/"
+        val name = parts.getOrNull(1).orEmpty()
+        if (name.isBlank() || mediaTypeForFileName(name) == "unknown") return null
+        return genericMediaKey(folder, name)
+    }
+
+    private fun genericMediaKey(folder: String, name: String): String {
+        return "${folder.trim().lowercase()}/${name.trim().lowercase()}"
+            .replace("//", "/")
     }
 
     private fun downloadPhoto(folder: String, name: String?, id: String?, result: MethodChannel.Result) {
@@ -703,6 +779,8 @@ class UsbCameraSdkPlugin :
         activeConnection = null
         activeDevice = null
         activeBackend = "libgphoto2"
+        genericMediaCatalog.clear()
+        lastGenericMediaPollAtMs = 0L
         appendCameraLog("disconnect complete")
         emitEvent("disconnected", null)
     }
@@ -918,3 +996,5 @@ private val IMAGE_EXTENSIONS = setOf(
 private val VIDEO_EXTENSIONS = setOf(
     "mp4", "mov", "m4v", "avi", "mts", "m2ts", "webm",
 )
+
+private const val GENERIC_MEDIA_POLL_INTERVAL_MS = 2_000L
