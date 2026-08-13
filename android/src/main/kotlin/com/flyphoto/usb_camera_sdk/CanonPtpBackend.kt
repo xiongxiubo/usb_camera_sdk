@@ -56,6 +56,7 @@ internal class CanonPtpBackend(
     private val inspectedHandles = mutableSetOf<Int>()
     private var keepAliveSupported = true
     private var lastKeepAliveAtMs = 0L
+    private var lastCatalogReconcileAtMs = 0L
 
     fun connect() {
         selectPtpInterface()
@@ -89,7 +90,7 @@ internal class CanonPtpBackend(
         }
     }
 
-    fun startPhotoEventListening() {
+    fun startMediaEventListening() {
         check(running.get()) { "佳能 PTP 未连接" }
         if (!eventListening.compareAndSet(false, true)) return
         val generation = eventGeneration.incrementAndGet()
@@ -97,7 +98,7 @@ internal class CanonPtpBackend(
         startEventLoop(generation)
     }
 
-    fun stopPhotoEventListening() {
+    fun stopMediaEventListening() {
         if (!eventListening.getAndSet(false)) return
         eventGeneration.incrementAndGet()
         log("canon_ptp event listening stop requested")
@@ -114,7 +115,7 @@ internal class CanonPtpBackend(
     }
 
     fun close() {
-        stopPhotoEventListening()
+        stopMediaEventListening()
         running.set(false)
         synchronized(ioLock) {
             runCatching { transaction(CLOSE_SESSION, timeoutMs = CLOSE_TIMEOUT_MS) }
@@ -250,6 +251,11 @@ internal class CanonPtpBackend(
                             ).data
                             if (!isActiveEventGeneration(generation)) return@synchronized
                             handleEosEvents(eventData)
+                            if (System.currentTimeMillis() - lastCatalogReconcileAtMs >= CATALOG_RECONCILE_INTERVAL_MS) {
+                                runCatching { reconcileHandleCatalog() }
+                                    .onFailure { error -> log("canon_ptp event catalog reconcile failed: ${error.message}") }
+                                lastCatalogReconcileAtMs = System.currentTimeMillis()
+                            }
                             resolvePendingPhotos()
                             keepDeviceOnIfDue()
                         }
@@ -286,7 +292,8 @@ internal class CanonPtpBackend(
                 keepDeviceOnIfDue(force = true)
                 return@forEach
             }
-            if (event.code != CanonEosEventParser.OBJECT_ADDED_EX &&
+            if (event.code != CanonEosEventParser.OBJECT_ADDED &&
+                event.code != CanonEosEventParser.OBJECT_ADDED_EX &&
                 event.code != CanonEosEventParser.OBJECT_ADDED_EX_64
             ) {
                 return@forEach
@@ -297,7 +304,10 @@ internal class CanonPtpBackend(
             if (photoCache.containsKey(handle)) return@forEach
             if (!photoHandles.offer(handle, now)) return@forEach
             val photo = eosPhoto.toPhotoOrNull()
-            if (photo == null) return@forEach
+            if (photo == null) {
+                log("canon_ptp event queued handle=${handle.hex()} for ObjectInfo resolution")
+                return@forEach
+            }
             inspectedHandles += handle
             photoCache[handle] = photo
             photoHandles.markPublished(handle)
@@ -323,6 +333,10 @@ internal class CanonPtpBackend(
                 return@forEach
             }
             if (info == null || !info.isPhoto) {
+                log(
+                    "canon_ptp object ignored handle=${handle.hex()} " +
+                        "fileName=${info?.fileName.orEmpty()} format=${info?.objectFormat ?: 0}",
+                )
                 photoHandles.discard(handle)
                 inspectedHandles += handle
                 return@forEach
@@ -333,6 +347,23 @@ internal class CanonPtpBackend(
             photoCache[handle] = photo
             photoHandles.markPublished(handle)
             publishPhoto(photo)
+        }
+    }
+
+    private fun reconcileHandleCatalog() {
+        val snapshot = readHandleSnapshot()
+        if (!handleCatalog.hasSameStorage(snapshot.storageIds)) {
+            replaceCatalogBaseline(snapshot)
+            log("canon_ptp event catalog baseline reset storages=${snapshot.storageIds.size} handles=${snapshot.allHandles.size}")
+            return
+        }
+        val newHandles = handleCatalog.reconcile(snapshot.allHandles)
+        if (newHandles.isNotEmpty()) {
+            log("canon_ptp event catalog discovered handles=${newHandles.size}")
+        }
+        val now = System.currentTimeMillis()
+        newHandles.forEach { handle ->
+            if (photoCache.containsKey(handle) || !photoHandles.offer(handle, now)) return@forEach
         }
     }
 
@@ -424,10 +455,17 @@ internal class CanonPtpBackend(
 
     private fun getObjectInfo(handle: Int): CanonPtpObjectInfo? {
         val data = transaction(GET_OBJECT_INFO, intArrayOf(handle)).data
-        return CanonPtpObjectInfo.decode(data)
+        val info = CanonPtpObjectInfo.decode(data)
+        log(
+            "canon_ptp object info handle=${handle.hex()} " +
+                "fileName=${info?.fileName.orEmpty()} size=${info?.compressedSize ?: 0} " +
+                "format=${info?.objectFormat ?: 0}",
+        )
+        return info
     }
 
     private fun downloadObject(handle: Int, output: FileOutputStream) {
+        log("canon_ptp download start handle=${handle.hex()}")
         val expectedTransactionId = writeCommand(GET_OBJECT, intArrayOf(handle))
         var responseReceived = false
         while (!responseReceived) {
@@ -455,6 +493,7 @@ internal class CanonPtpBackend(
                 }
             }
         }
+        log("canon_ptp download complete handle=${handle.hex()}")
     }
 
     private fun transaction(
@@ -622,6 +661,7 @@ internal class CanonPtpBackend(
         private const val EVENT_USB_TIMEOUT_MS = 2_500
         private const val CLOSE_TIMEOUT_MS = 2_000
         private const val EVENT_PERIOD_MS = 700L
+        private const val CATALOG_RECONCILE_INTERVAL_MS = 2_000L
         private const val EVENT_STOP_TIMEOUT_MS = 3_000L
         private const val KEEP_ALIVE_INTERVAL_MS = 20_000L
         private const val KEEP_ALIVE_TIMEOUT_MS = 2_500

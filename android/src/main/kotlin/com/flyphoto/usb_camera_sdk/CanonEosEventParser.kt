@@ -26,6 +26,7 @@ internal data class CanonEosEventBatch(
 
 /** Decoder for Canon EOS GetEvent records, including the R-series 64-bit variant. */
 internal object CanonEosEventParser {
+    const val OBJECT_ADDED = 0x4002
     const val OBJECT_ADDED_EX = 0xc181
     const val WILL_SOON_SHUTDOWN = 0xc18d
     const val OBJECT_ADDED_EX_64 = 0xc1a7
@@ -42,6 +43,7 @@ internal object CanonEosEventParser {
             }
             if (eventLength == EVENT_HEADER_SIZE && eventCode == 0) break
             val photo = when (eventCode) {
+                OBJECT_ADDED -> decodeHandleOnly(payload, eventStart, eventLength)
                 OBJECT_ADDED_EX -> decodePhoto(payload, eventStart, eventLength, NAME_OFFSET_32, PARENT_OFFSET_32)
                 OBJECT_ADDED_EX_64 -> decodePhoto(payload, eventStart, eventLength, NAME_OFFSET_64, PARENT_OFFSET_64)
                 else -> null
@@ -98,6 +100,23 @@ internal object CanonEosEventParser {
             compressedSize = compressedSize,
             parentObject = parentObject,
             fileName = fileName,
+        )
+    }
+
+    private fun decodeHandleOnly(
+        payload: ByteArray,
+        eventStart: Int,
+        eventLength: Int,
+    ): CanonEosPhotoEvent? {
+        if (eventLength < HANDLE_OFFSET + Int.SIZE_BYTES) return null
+        val buffer = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        return CanonEosPhotoEvent(
+            handle = buffer.getInt(eventStart + HANDLE_OFFSET),
+            storageId = 0,
+            objectFormat = 0,
+            compressedSize = 0L,
+            parentObject = 0,
+            fileName = "",
         )
     }
 

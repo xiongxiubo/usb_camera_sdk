@@ -43,11 +43,11 @@ class UsbCameraSdkPlugin :
     private val bridge = GPhoto2Bridge()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val cameraDispatcher = CameraOperationDispatcher()
-    private val photoEventListening = AtomicBoolean(false)
-    private val pendingPhotoEventLock = Any()
+    private val mediaEventListening = AtomicBoolean(false)
+    private val pendingMediaEventLock = Any()
     private val cameraOperationLock = Any()
-    private val pendingPhotoEvents = mutableListOf<Map<String, Any?>>()
-    private val photoEventPollScheduled = AtomicBoolean(false)
+    private val pendingMediaEvents = mutableListOf<Map<String, Any?>>()
+    private val mediaEventPollScheduled = AtomicBoolean(false)
     private var eventSink: EventChannel.EventSink? = null
     private var pendingPermissionResult: MethodChannel.Result? = null
     @Volatile
@@ -78,7 +78,7 @@ class UsbCameraSdkPlugin :
                             "active=${activeDevice?.deviceName} backend=$activeBackend",
                     )
                     if (detached?.deviceName == activeDevice?.deviceName) {
-                        photoEventListening.set(false)
+                        mediaEventListening.set(false)
                         cameraDispatcher.execute(::disconnectCamera)
                     }
                     emitEvent("deviceDetached", detached?.toMap())
@@ -100,7 +100,7 @@ class UsbCameraSdkPlugin :
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        photoEventListening.set(false)
+        mediaEventListening.set(false)
         cameraDispatcher.execute(::disconnectCamera)
         cameraDispatcher.shutdown()
         unregisterUsbReceiver()
@@ -145,14 +145,14 @@ class UsbCameraSdkPlugin :
                 connect(call.argument<String>("deviceName"), mainResult)
             }
             "disconnect" -> {
-                photoEventListening.set(false)
+                mediaEventListening.set(false)
                 cameraDispatcher.execute {
                     disconnectCamera()
                     mainResult.success(null)
                 }
             }
             "releaseCameraControl" -> {
-                photoEventListening.set(false)
+                mediaEventListening.set(false)
                 cameraDispatcher.execute {
                     releaseCameraControl()
                     mainResult.success(null)
@@ -174,22 +174,22 @@ class UsbCameraSdkPlugin :
             "drainPhotoEvents" -> result.success(drainPhotoEvents())
             "drainMediaEvents" -> result.success(drainMediaEvents())
             "startPhotoEventListening" -> {
-                cameraDispatcher.execute { startPhotoEventListening(mainResult) }
+                cameraDispatcher.execute { startMediaEventListening(mainResult) }
             }
             "startMediaEventListening" -> {
-                cameraDispatcher.execute { startPhotoEventListening(mainResult) }
+                cameraDispatcher.execute { startMediaEventListening(mainResult) }
             }
             "stopPhotoEventListening" -> {
-                photoEventListening.set(false)
+                mediaEventListening.set(false)
                 cameraDispatcher.execute {
-                    stopPhotoEventListening()
+                    stopMediaEventListening()
                     mainResult.success(null)
                 }
             }
             "stopMediaEventListening" -> {
-                photoEventListening.set(false)
+                mediaEventListening.set(false)
                 cameraDispatcher.execute {
-                    stopPhotoEventListening()
+                    stopMediaEventListening()
                     mainResult.success(null)
                 }
             }
@@ -476,7 +476,7 @@ class UsbCameraSdkPlugin :
                 .getOrDefault(emptyList())
                 .map { photo -> photo.toMap() }
         }
-        return synchronized(cameraOperationLock) {
+        val files = synchronized(cameraOperationLock) {
             bridge.nativeListFiles(folder)
         }.map { encoded ->
             val parts = encoded.split("|")
@@ -491,6 +491,13 @@ class UsbCameraSdkPlugin :
                 "mimeType" to mimeTypeForFileName(parts.getOrNull(1) ?: encoded),
             )
         }
+        files.filter { it["mediaType"] == "unknown" }.forEach { file ->
+            appendCameraLog(
+                "media list ignored unknown file=${file["fileName"]} " +
+                    "folder=${file["folder"]}",
+            )
+        }
+        return files
     }
 
     private fun listPhotos(folder: String): List<Map<String, Any?>> =
@@ -510,30 +517,30 @@ class UsbCameraSdkPlugin :
         listNewMedia(folder).filter { it["mediaType"] == "image" }
 
     private fun drainPhotoEvents(): List<Map<String, Any?>> {
-        return synchronized(pendingPhotoEventLock) {
-            val events = pendingPhotoEvents.filter { it["mediaType"] == "image" }
-            pendingPhotoEvents.clear()
+        return synchronized(pendingMediaEventLock) {
+            val events = pendingMediaEvents.filter { it["mediaType"] == "image" }
+            pendingMediaEvents.clear()
             events
         }
     }
 
     private fun drainMediaEvents(): List<Map<String, Any?>> {
-        return synchronized(pendingPhotoEventLock) {
-            val events = pendingPhotoEvents.toList()
-            pendingPhotoEvents.clear()
+        return synchronized(pendingMediaEventLock) {
+            val events = pendingMediaEvents.toList()
+            pendingMediaEvents.clear()
             events
         }
     }
 
-    private fun startPhotoEventListening(result: MethodChannel.Result) {
+    private fun startMediaEventListening(result: MethodChannel.Result) {
         if (activeDevice == null || activeConnection == null) {
             result.error("not_connected", "USB 相机未连接", null)
             return
         }
-        runCatching { startPhotoEventListening() }
+        runCatching { startMediaEventListening() }
             .onSuccess { result.success(null) }
             .onFailure { error ->
-                appendCameraLog("photo event listening failed: ${error.message}")
+                appendCameraLog("media event listening failed: ${error.message}")
                 result.error(
                     "event_listening_failed",
                     error.message ?: "相机事件监听启动失败",
@@ -542,51 +549,51 @@ class UsbCameraSdkPlugin :
             }
     }
 
-    private fun startPhotoEventListening() {
+    private fun startMediaEventListening() {
         if (activeDevice == null || activeConnection == null) {
-            appendCameraLog("photo event listening skipped: not connected")
+            appendCameraLog("media event listening skipped: not connected")
             return
         }
-        if (!photoEventListening.compareAndSet(false, true)) return
-        appendCameraLog("photo event listening start")
+        if (!mediaEventListening.compareAndSet(false, true)) return
+        appendCameraLog("media event listening start")
         canonPtpBackend?.let { backend ->
-            runCatching { backend.startPhotoEventListening() }.onFailure {
-                photoEventListening.set(false)
+            runCatching { backend.startMediaEventListening() }.onFailure {
+                mediaEventListening.set(false)
                 throw it
             }
             return
         }
-        schedulePhotoEventPoll()
+        scheduleMediaEventPoll()
     }
 
-    private fun stopPhotoEventListening() {
-        val wasListening = photoEventListening.getAndSet(false)
-        canonPtpBackend?.stopPhotoEventListening()
-        if (wasListening) appendCameraLog("photo event listening stop requested")
+    private fun stopMediaEventListening() {
+        val wasListening = mediaEventListening.getAndSet(false)
+        canonPtpBackend?.stopMediaEventListening()
+        if (wasListening) appendCameraLog("media event listening stop requested")
     }
 
-    private fun schedulePhotoEventPoll() {
-        if (!photoEventListening.get() || canonPtpBackend != null) return
-        if (!photoEventPollScheduled.compareAndSet(false, true)) return
+    private fun scheduleMediaEventPoll() {
+        if (!mediaEventListening.get() || canonPtpBackend != null) return
+        if (!mediaEventPollScheduled.compareAndSet(false, true)) return
         cameraDispatcher.schedule(25) {
-            photoEventPollScheduled.set(false)
-            if (!photoEventListening.get() || canonPtpBackend != null) return@schedule
+            mediaEventPollScheduled.set(false)
+            if (!mediaEventListening.get() || canonPtpBackend != null) return@schedule
             val event = synchronized(cameraOperationLock) {
                 bridge.nativeWaitForEvent(250)
             }
-            if (photoEventListening.get()) handlePhotoEventResult(event)
+            if (mediaEventListening.get()) handleMediaEventResult(event)
             // Re-submit instead of looping while holding/reacquiring the lock. Any
             // foreground list/download request already queued runs before this poll.
-            schedulePhotoEventPoll()
+            scheduleMediaEventPoll()
         }
     }
 
-    private fun handlePhotoEventResult(event: String) {
+    private fun handleMediaEventResult(event: String) {
         when {
             event == "timeout" || event == "captureComplete" || event == "unknown" -> return
             event == "disconnected" -> {
-                appendCameraLog("photo event disconnected")
-                photoEventListening.set(false)
+                appendCameraLog("media event disconnected")
+                mediaEventListening.set(false)
             }
             event.startsWith("fileAdded|") -> {
                 val parts = event.split("|", limit = 3)
@@ -595,23 +602,26 @@ class UsbCameraSdkPlugin :
                 appendCameraLog("media event fileAdded folder=$folder name=$name")
                 if (name.isBlank()) return
                 val payload = mediaPayload(folder, name)
-                if (payload["mediaType"] == "unknown") return
-                synchronized(pendingPhotoEventLock) {
-                    pendingPhotoEvents.add(payload)
+                if (payload["mediaType"] == "unknown") {
+                    appendCameraLog("media event ignored unknown file=$name folder=$folder")
+                    return
+                }
+                synchronized(pendingMediaEventLock) {
+                    pendingMediaEvents.add(payload)
                 }
                 emitEvent(
                     if (payload["mediaType"] == "video") "mediaAdded" else "photoAdded",
                     payload,
                 )
             }
-            event.startsWith("folderAdded|") -> appendCameraLog("photo event $event")
+            event.startsWith("folderAdded|") -> appendCameraLog("media event $event")
             event.startsWith("error|") -> {
-                appendCameraLog("photo event $event")
+                appendCameraLog("media event $event")
                 if (event.contains("Could not find the requested device on the USB port")) {
-                    photoEventListening.set(false)
+                    mediaEventListening.set(false)
                 }
             }
-            else -> appendCameraLog("photo event unhandled=$event")
+            else -> appendCameraLog("media event unhandled=$event")
         }
     }
 
@@ -676,7 +686,7 @@ class UsbCameraSdkPlugin :
 
     private fun releaseCameraControl() {
         appendCameraLog("release camera control start")
-        stopPhotoEventListening()
+        stopMediaEventListening()
         canonPtpBackend?.close() ?: synchronized(cameraOperationLock) { bridge.nativeDisconnect() }
         appendCameraLog("release camera control done")
     }
@@ -685,7 +695,7 @@ class UsbCameraSdkPlugin :
         appendCameraLog(
             "disconnect start device=${activeDevice?.deviceName} backend=$activeBackend",
         )
-        stopPhotoEventListening()
+        stopMediaEventListening()
         canonPtpBackend?.close()
         canonPtpBackend = null
         synchronized(cameraOperationLock) { bridge.nativeDisconnect() }
@@ -698,9 +708,9 @@ class UsbCameraSdkPlugin :
     }
 
     private fun handleCanonPhotoAdded(photo: CanonPtpPhoto) {
-        if (!photoEventListening.get()) return
+        if (!mediaEventListening.get()) return
         val payload = photo.toMap()
-        synchronized(pendingPhotoEventLock) { pendingPhotoEvents.add(payload) }
+        synchronized(pendingMediaEventLock) { pendingMediaEvents.add(payload) }
         emitEvent(
             if (payload["mediaType"] == "video") "mediaAdded" else "photoAdded",
             payload,
