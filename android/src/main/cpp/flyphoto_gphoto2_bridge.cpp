@@ -14,6 +14,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <unistd.h>
 #include <vector>
 
@@ -33,6 +34,16 @@ Camera* g_camera = nullptr;
 GPContext* g_context = nullptr;
 std::string g_log_file_path;
 int g_log_func_id = -1;
+
+struct MediaScanReport {
+    int root_files_result = GP_ERROR;
+    int root_folders_result = GP_ERROR;
+    int visited_folder_count = 0;
+    int discovered_file_count = 0;
+    std::vector<std::string> errors;
+};
+
+MediaScanReport g_last_media_scan_report;
 
 std::string timestamp() {
     const auto now = std::chrono::system_clock::now();
@@ -383,37 +394,94 @@ std::string join_folder(const std::string& parent, const char* child) {
     return parent + "/" + child_name;
 }
 
-void collect_camera_files(const std::string& folder, std::vector<std::string>& encoded) {
+std::string scan_error(
+    const std::string& folder,
+    const char* operation,
+    int result) {
+    std::string message = folder + " " + operation + ": " + gp_error(result);
+    for (char& character : message) {
+        if (character == '\n' || character == '\r' || character == '\t') character = ' ';
+    }
+    return message;
+}
+
+void record_scan_error(
+    MediaScanReport& report,
+    const std::string& folder,
+    const char* operation,
+    int result) {
+    if (report.errors.size() >= 20) return;
+    report.errors.push_back(scan_error(folder, operation, result));
+}
+
+void collect_camera_files(
+    const std::string& folder,
+    std::vector<std::string>& encoded,
+    MediaScanReport& report,
+    std::unordered_set<std::string>& visited_folders,
+    std::unordered_set<std::string>& discovered_files,
+    int depth = 0) {
+    if (depth > 32 || visited_folders.size() >= 512) {
+        record_scan_error(report, folder, "scan limit", GP_ERROR);
+        return;
+    }
+    if (!visited_folders.insert(folder).second) return;
+    report.visited_folder_count = static_cast<int>(visited_folders.size());
+
     CameraList* files = nullptr;
     int result = gp_list_new(&files);
     if (result >= GP_OK) {
         result = gp_camera_folder_list_files(g_camera, folder.c_str(), files, g_context);
+        if (depth == 0) report.root_files_result = result;
         native_log("list files folder=" + folder + " result=" + std::to_string(result) + " " + gp_error(result));
         if (result >= GP_OK) {
             const int count = gp_list_count(files);
             for (int i = 0; i < count; ++i) {
                 const char* name = nullptr;
                 gp_list_get_name(files, i, &name);
-                encoded.push_back(folder + "|" + (name == nullptr ? "" : name) + "|0|");
+                const std::string file_name = name == nullptr ? "" : name;
+                const std::string file_key = folder + "/" + file_name;
+                if (!file_name.empty() && discovered_files.insert(file_key).second) {
+                    encoded.push_back(folder + "|" + file_name + "|0|");
+                }
             }
+        } else {
+            record_scan_error(report, folder, "list files", result);
         }
         gp_list_unref(files);
+    } else {
+        if (depth == 0) report.root_files_result = result;
+        record_scan_error(report, folder, "create file list", result);
     }
 
     CameraList* folders = nullptr;
     result = gp_list_new(&folders);
-    if (result < GP_OK) return;
+    if (result < GP_OK) {
+        if (depth == 0) report.root_folders_result = result;
+        record_scan_error(report, folder, "create folder list", result);
+        return;
+    }
     result = gp_camera_folder_list_folders(g_camera, folder.c_str(), folders, g_context);
+    if (depth == 0) report.root_folders_result = result;
     native_log("list folders folder=" + folder + " result=" + std::to_string(result) + " " + gp_error(result));
     if (result >= GP_OK) {
         const int count = gp_list_count(folders);
         for (int i = 0; i < count; ++i) {
             const char* name = nullptr;
             gp_list_get_name(folders, i, &name);
-            collect_camera_files(join_folder(folder, name), encoded);
+            collect_camera_files(
+                join_folder(folder, name),
+                encoded,
+                report,
+                visited_folders,
+                discovered_files,
+                depth + 1);
         }
+    } else {
+        record_scan_error(report, folder, "list folders", result);
     }
     gp_list_unref(folders);
+    report.discovered_file_count = static_cast<int>(encoded.size());
 }
 
 void release_camera() {
@@ -545,11 +613,51 @@ Java_com_flyphoto_usb_1camera_1sdk_GPhoto2Bridge_nativeListFiles(
     const std::string requested_folder = java_string(env, folder);
     const std::string root = requested_folder.empty() ? "/" : requested_folder;
     std::vector<std::string> encoded;
-    collect_camera_files(root, encoded);
+    MediaScanReport report;
+    std::unordered_set<std::string> visited_folders;
+    std::unordered_set<std::string> discovered_files;
+    collect_camera_files(
+        root,
+        encoded,
+        report,
+        visited_folders,
+        discovered_files);
+    report.discovered_file_count = static_cast<int>(encoded.size());
+    g_last_media_scan_report = report;
+    native_log(
+        "media scan complete root=" + root +
+        " folders=" + std::to_string(report.visited_folder_count) +
+        " files=" + std::to_string(report.discovered_file_count) +
+        " errors=" + std::to_string(report.errors.size()));
 
     jobjectArray array = env->NewObjectArray(static_cast<jsize>(encoded.size()), string_class, nullptr);
     for (jsize i = 0; i < static_cast<jsize>(encoded.size()); ++i) {
         env->SetObjectArrayElement(array, i, make_string(env, encoded[static_cast<size_t>(i)]));
+    }
+    return array;
+}
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_flyphoto_usb_1camera_1sdk_GPhoto2Bridge_nativeGetLastMediaScanReport(
+    JNIEnv* env,
+    jobject /* thiz */) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const jclass string_class = env->FindClass("java/lang/String");
+    std::vector<std::string> values = {
+        "rootFilesResult=" + std::to_string(g_last_media_scan_report.root_files_result),
+        "rootFoldersResult=" + std::to_string(g_last_media_scan_report.root_folders_result),
+        "visitedFolderCount=" + std::to_string(g_last_media_scan_report.visited_folder_count),
+        "discoveredFileCount=" + std::to_string(g_last_media_scan_report.discovered_file_count),
+    };
+    for (const std::string& error : g_last_media_scan_report.errors) {
+        values.push_back("error=" + error);
+    }
+    jobjectArray array = env->NewObjectArray(
+        static_cast<jsize>(values.size()),
+        string_class,
+        nullptr);
+    for (jsize i = 0; i < static_cast<jsize>(values.size()); ++i) {
+        env->SetObjectArrayElement(array, i, make_string(env, values[static_cast<size_t>(i)]));
     }
     return array;
 }

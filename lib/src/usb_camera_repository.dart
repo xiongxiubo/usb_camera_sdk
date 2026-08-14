@@ -102,6 +102,17 @@ class UsbCameraRepository {
         .toList();
   }
 
+  Future<UsbCameraMediaScanResult> scanMedia({String folder = '/'}) async {
+    if (!isSupported) return UsbCameraMediaScanResult.empty;
+    final result = await _methodChannel.invokeMapMethod<dynamic, dynamic>(
+      'scanMedia',
+      {'folder': folder},
+    );
+    return result == null
+        ? UsbCameraMediaScanResult.empty
+        : UsbCameraMediaScanResult.fromMap(result);
+  }
+
   Future<List<UsbCameraPhoto>> listNewPhotos({String folder = '/'}) async {
     if (!isSupported) return const [];
     final result = await _methodChannel.invokeListMethod<dynamic>(
@@ -125,6 +136,17 @@ class UsbCameraRepository {
         .map(UsbCameraPhoto.fromMap)
         .where((file) => file.isSupportedMedia)
         .toList();
+  }
+
+  Future<UsbCameraMediaScanResult> scanNewMedia({String folder = '/'}) async {
+    if (!isSupported) return UsbCameraMediaScanResult.empty;
+    final result = await _methodChannel.invokeMapMethod<dynamic, dynamic>(
+      'scanNewMedia',
+      {'folder': folder},
+    );
+    return result == null
+        ? UsbCameraMediaScanResult.empty
+        : UsbCameraMediaScanResult.fromMap(result);
   }
 
   Future<List<UsbCameraPhoto>> drainPhotoEvents() async {
@@ -175,6 +197,16 @@ class UsbCameraRepository {
     await _methodChannel.invokeMethod<void>('appendCameraLog', {
       'message': message.trim(),
     });
+  }
+
+  Future<String> readCameraLog() async {
+    if (!isSupported) return '';
+    return await _methodChannel.invokeMethod<String>('getCameraLog') ?? '';
+  }
+
+  Future<String> exportCameraLog() async {
+    if (!isSupported) return '';
+    return await _methodChannel.invokeMethod<String>('exportCameraLog') ?? '';
   }
 
   Future<String> downloadPhoto(UsbCameraPhoto photo) async {

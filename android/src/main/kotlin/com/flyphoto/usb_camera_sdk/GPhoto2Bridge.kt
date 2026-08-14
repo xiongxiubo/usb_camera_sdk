@@ -10,6 +10,7 @@ class GPhoto2Bridge {
         deviceName: String,
     ): String
     external fun nativeListFiles(folder: String): Array<String>
+    external fun nativeGetLastMediaScanReport(): Array<String>
     external fun nativeWaitForEvent(timeoutMs: Int): String
     external fun nativeCapture(): String
     external fun nativeDownload(folder: String, name: String, destinationPath: String): String

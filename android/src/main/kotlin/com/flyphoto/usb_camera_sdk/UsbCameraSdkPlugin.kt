@@ -167,11 +167,17 @@ class UsbCameraSdkPlugin :
             "listMedia" -> cameraDispatcher.execute {
                 mainResult.success(listMedia(call.argument<String>("folder") ?: "/"))
             }
+            "scanMedia" -> cameraDispatcher.execute {
+                mainResult.success(scanMedia(call.argument<String>("folder") ?: "/").toMap())
+            }
             "listNewPhotos" -> cameraDispatcher.execute {
                 mainResult.success(listNewPhotos(call.argument<String>("folder") ?: "/"))
             }
             "listNewMedia" -> cameraDispatcher.execute {
                 mainResult.success(listNewMedia(call.argument<String>("folder") ?: "/"))
+            }
+            "scanNewMedia" -> cameraDispatcher.execute {
+                mainResult.success(scanNewMedia(call.argument<String>("folder") ?: "/").toMap())
             }
             "drainPhotoEvents" -> result.success(drainPhotoEvents())
             "drainMediaEvents" -> result.success(drainMediaEvents())
@@ -211,8 +217,8 @@ class UsbCameraSdkPlugin :
                     result = mainResult,
                 )
             }
-            "getCameraLog" -> result.success("")
-            "getCameraLogPath" -> result.success(cameraLogPath())
+            "getCameraLog" -> result.success(internalCameraLogFile().readTextIfExists())
+            "getCameraLogPath" -> result.success(internalCameraLogFile().absolutePath)
             "exportCameraLog" -> result.success(exportCameraLogToDownloads())
             "appendCameraLog" -> {
                 cameraDispatcher.execute {
@@ -306,11 +312,11 @@ class UsbCameraSdkPlugin :
         appendCameraLog("requestedDeviceName=$deviceName")
         val device = findDevice(deviceName)
         if (device == null) {
-            appendCameraLog("no_device: ${manager.deviceList.values.map { it.toMap() }}")
+            appendCameraLog("no_device: ${manager.deviceList.values.map { it.toLogMap() }}")
             result.error("no_device", "未找到 USB 相机", null)
             return
         }
-        appendCameraLog("device=${device.toMap()}")
+        appendCameraLog("device=${device.toLogMap()}")
         if (!manager.hasPermission(device)) {
             appendCameraLog("permission_denied")
             result.error("permission_denied", "没有 USB 设备权限", device.toMap())
@@ -366,10 +372,10 @@ class UsbCameraSdkPlugin :
 
         val pluginDir = preparePluginDirectory()
         val tempDir = File(applicationContext.cacheDir, "gphoto2").apply { mkdirs() }.absolutePath
-        bridge.nativeSetLogFile("")
+        bridge.nativeSetLogFile(internalCameraLogFile().absolutePath)
         appendCameraLog("pluginDir=$pluginDir")
         appendCameraLog("tempDir=$tempDir")
-        appendCameraLog("logFile=${cameraLogPath()}")
+        appendCameraLog("logFile=${internalCameraLogFile().absolutePath}")
         appendCameraLog("pluginFiles=${File(pluginDir, "lib/libgphoto2_port/0.12.2").listFiles()?.map { it.name }}")
         val initResult = synchronized(cameraOperationLock) {
             bridge.nativeInit(pluginDir, tempDir)
@@ -413,7 +419,7 @@ class UsbCameraSdkPlugin :
         val payload = device.toMap().toMutableMap().apply {
             put("model", device.productName ?: device.deviceName)
             if (pluginDir != null) put("pluginDir", pluginDir)
-            put("logFile", cameraLogPath())
+            put("logFile", internalCameraLogFile().absolutePath)
             put("exportedLogFile", cameraLogPath())
             put("isCanon", isCanon)
             put("backend", activeBackend)
@@ -427,7 +433,7 @@ class UsbCameraSdkPlugin :
         if (isCanon) {
             appendCameraLog("canon strategy=${payload["canonStrategy"]} backend=$activeBackend")
         }
-        appendCameraLog("connect success payload=$payload")
+        appendCameraLog("connect success payload=${payload.redactedForLog()}")
         emitEvent("connected", payload)
         result.success(payload)
     }
@@ -473,16 +479,34 @@ class UsbCameraSdkPlugin :
         )
     }
 
-    private fun listMedia(folder: String): List<Map<String, Any?>> {
+    private fun scanMedia(folder: String): CameraMediaScanPayload {
         canonPtpBackend?.let { backend ->
-            return runCatching { backend.listPhotos() }
-                .onFailure { error -> appendCameraLog("canon_ptp listMedia failed: ${error.message}") }
-                .getOrDefault(emptyList())
-                .map { photo -> photo.toMap() }
+            return runCatching {
+                val media = backend.listPhotos().map { photo -> photo.toMap() }
+                CameraMediaScanPayload(
+                    media = media,
+                    state = if (media.isEmpty()) "empty" else "ready",
+                    backend = activeBackend,
+                    folderCount = media.map { it["folder"] }.distinct().size,
+                    fileCount = media.size,
+                )
+            }.getOrElse { error ->
+                appendCameraLog("canon_ptp listMedia failed: ${error.message}")
+                CameraMediaScanPayload(
+                    state = "failed",
+                    backend = activeBackend,
+                    errors = listOf(error.message ?: "佳能媒体扫描失败"),
+                )
+            }
         }
-        val files = synchronized(cameraOperationLock) {
-            bridge.nativeListFiles(folder)
-        }.map { encoded ->
+        return scanGenericMedia(folder)
+    }
+
+    private fun scanGenericMedia(folder: String): CameraMediaScanPayload {
+        val (encodedFiles, reportValues) = synchronized(cameraOperationLock) {
+            bridge.nativeListFiles(folder) to bridge.nativeGetLastMediaScanReport()
+        }
+        val files = encodedFiles.map { encoded ->
             val parts = encoded.split("|")
             mapOf(
                 "id" to encoded,
@@ -501,21 +525,63 @@ class UsbCameraSdkPlugin :
                     "folder=${file["folder"]}",
             )
         }
-        return files
+        val report = NativeMediaScanReport.fromValues(reportValues)
+        val supported = files.filter { it["mediaType"] != "unknown" }
+        val rootFailed = report.rootFilesResult < 0 && report.rootFoldersResult < 0
+        val sonyStorageUnavailable = activeDevice?.vendorId == SONY_VENDOR_ID &&
+            report.discoveredFileCount == 0 && report.visitedFolderCount <= 1
+        val state = when {
+            supported.isNotEmpty() -> "ready"
+            rootFailed -> "failed"
+            sonyStorageUnavailable -> "storage_unavailable"
+            else -> "empty"
+        }
+        appendCameraLog(
+            "media scan state=$state backend=$activeBackend " +
+                "folders=${report.visitedFolderCount} files=${report.discoveredFileCount} " +
+                "supported=${supported.size} errors=${report.errors.size}",
+        )
+        report.errors.forEach { error -> appendCameraLog("media scan error=$error") }
+        return CameraMediaScanPayload(
+            media = supported,
+            state = state,
+            backend = activeBackend,
+            folderCount = report.visitedFolderCount,
+            fileCount = report.discoveredFileCount,
+            errors = report.errors,
+        )
     }
+
+    private fun listMedia(folder: String): List<Map<String, Any?>> = scanMedia(folder).media
 
     private fun listPhotos(folder: String): List<Map<String, Any?>> =
         listMedia(folder).filter { it["mediaType"] == "image" }
 
-    private fun listNewMedia(folder: String): List<Map<String, Any?>> {
+    private fun scanNewMedia(folder: String): CameraMediaScanPayload {
         canonPtpBackend?.let { backend ->
-            return runCatching { backend.listNewPhotos() }
-                .onFailure { error -> appendCameraLog("canon_ptp listNewMedia failed: ${error.message}") }
-                .getOrDefault(emptyList())
-                .map { photo -> photo.toMap() }
+            return runCatching {
+                val media = backend.listNewPhotos().map { photo -> photo.toMap() }
+                CameraMediaScanPayload(
+                    media = media,
+                    state = if (media.isEmpty()) "empty" else "ready",
+                    backend = activeBackend,
+                    folderCount = media.map { it["folder"] }.distinct().size,
+                    fileCount = media.size,
+                )
+            }.getOrElse { error ->
+                appendCameraLog("canon_ptp listNewMedia failed: ${error.message}")
+                CameraMediaScanPayload(
+                    state = "failed",
+                    backend = activeBackend,
+                    errors = listOf(error.message ?: "佳能增量媒体扫描失败"),
+                )
+            }
         }
-        return listMedia(folder)
+        return scanGenericMedia(folder)
     }
+
+    private fun listNewMedia(folder: String): List<Map<String, Any?>> =
+        scanNewMedia(folder).media
 
     private fun listNewPhotos(folder: String): List<Map<String, Any?>> =
         listNewMedia(folder).filter { it["mediaType"] == "image" }
@@ -854,21 +920,10 @@ class UsbCameraSdkPlugin :
     }
 
     private fun prepareCameraLogFile() {
-        deleteInternalCameraLog()
         runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val resolver = applicationContext.contentResolver
-                val uri = downloadsLogUri ?: findOrCreateDownloadsLogUri()
-                downloadsLogUri = uri
-                resolver.openOutputStream(uri, "wt")?.use { output ->
-                    output.write("${LocalDateTime.now()} camera log start\n".toByteArray())
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                val file = legacyDownloadsLogFile()
-                file.parentFile?.mkdirs()
-                file.writeText("${LocalDateTime.now()} camera log start\n")
-            }
+            val file = internalCameraLogFile()
+            file.parentFile?.mkdirs()
+            file.writeText("${LocalDateTime.now()} camera log start\n")
         }
     }
 
@@ -883,20 +938,31 @@ class UsbCameraSdkPlugin :
     private fun appendCameraLog(message: String) {
         val line = "${LocalDateTime.now()} [android] $message\n"
         runCatching {
+            val file = internalCameraLogFile()
+            file.parentFile?.mkdirs()
+            file.appendText(line)
+        }
+    }
+
+    private fun exportCameraLogToDownloads(): String {
+        val source = internalCameraLogFile()
+        if (!source.isFile) return ""
+        return runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val resolver = applicationContext.contentResolver
                 val uri = downloadsLogUri ?: findOrCreateDownloadsLogUri()
                 downloadsLogUri = uri
-                resolver.openOutputStream(uri, "wa")?.use { output ->
-                    output.write(line.toByteArray())
-                }
+                resolver.openOutputStream(uri, "wt")?.use { output ->
+                    source.inputStream().use { input -> input.copyTo(output) }
+                } ?: error("open Downloads log failed")
             } else {
-                legacyDownloadsLogFile().appendText(line)
+                val destination = legacyDownloadsLogFile()
+                destination.parentFile?.mkdirs()
+                source.copyTo(destination, overwrite = true)
             }
-        }
+            cameraLogPath()
+        }.getOrDefault("")
     }
-
-    private fun exportCameraLogToDownloads(): String = cameraLogPath()
 
     private fun findOrCreateDownloadsLogUri(): Uri {
         val resolver = applicationContext.contentResolver
@@ -928,11 +994,8 @@ class UsbCameraSdkPlugin :
         return File(downloads, "flyphoto-camera-usb.log")
     }
 
-    private fun deleteInternalCameraLog() {
-        runCatching {
-            File(applicationContext.filesDir, "logs/camera-usb.log").delete()
-        }
-    }
+    private fun internalCameraLogFile(): File =
+        File(applicationContext.filesDir, "logs/camera-usb.log")
 
     private fun File.readTextIfExists(): String {
         return if (exists()) readText() else ""
@@ -986,7 +1049,64 @@ class UsbCameraSdkPlugin :
             "isCanon" to isCanon(),
         )
     }
+
+    private fun UsbDevice.toLogMap(): Map<String, Any?> =
+        toMap().redactedForLog()
 }
+
+private data class CameraMediaScanPayload(
+    val media: List<Map<String, Any?>> = emptyList(),
+    val state: String,
+    val backend: String,
+    val folderCount: Int = 0,
+    val fileCount: Int = 0,
+    val errors: List<String> = emptyList(),
+) {
+    fun toMap(): Map<String, Any?> = mapOf(
+        "media" to media,
+        "state" to state,
+        "backend" to backend,
+        "folderCount" to folderCount,
+        "fileCount" to fileCount,
+        "errors" to errors,
+    )
+}
+
+private data class NativeMediaScanReport(
+    val rootFilesResult: Int,
+    val rootFoldersResult: Int,
+    val visitedFolderCount: Int,
+    val discoveredFileCount: Int,
+    val errors: List<String>,
+) {
+    companion object {
+        fun fromValues(values: Array<String>): NativeMediaScanReport {
+            fun integer(key: String): Int = values
+                .firstOrNull { it.startsWith("$key=") }
+                ?.substringAfter('=')
+                ?.toIntOrNull() ?: -1
+
+            return NativeMediaScanReport(
+                rootFilesResult = integer("rootFilesResult"),
+                rootFoldersResult = integer("rootFoldersResult"),
+                visitedFolderCount = integer("visitedFolderCount").coerceAtLeast(0),
+                discoveredFileCount = integer("discoveredFileCount").coerceAtLeast(0),
+                errors = values
+                    .filter { it.startsWith("error=") }
+                    .map { it.substringAfter('=').trim() }
+                    .filter { it.isNotEmpty() },
+            )
+        }
+    }
+}
+
+private fun Map<String, Any?>.redactedForLog(): Map<String, Any?> =
+    toMutableMap().apply {
+        val serial = this["serialNumber"]?.toString().orEmpty()
+        if (serial.isNotEmpty()) {
+            this["serialNumber"] = if (serial.length <= 4) "****" else "****${serial.takeLast(4)}"
+        }
+    }
 
 private val IMAGE_EXTENSIONS = setOf(
     "jpg", "jpeg", "jpe", "arw", "raw", "dng", "cr2", "cr3", "nef", "raf",
@@ -997,4 +1117,5 @@ private val VIDEO_EXTENSIONS = setOf(
     "mp4", "mov", "m4v", "avi", "mts", "m2ts", "webm",
 )
 
+private const val SONY_VENDOR_ID = 0x054c
 private const val GENERIC_MEDIA_POLL_INTERVAL_MS = 2_000L

@@ -18,6 +18,22 @@ enum UsbCameraMediaType {
   unknown,
 }
 
+enum UsbCameraMediaScanState {
+  ready,
+  empty,
+  storageUnavailable,
+  failed;
+
+  static UsbCameraMediaScanState fromWire(String? value) {
+    return switch (value?.trim().toLowerCase()) {
+      'ready' => UsbCameraMediaScanState.ready,
+      'storage_unavailable' => UsbCameraMediaScanState.storageUnavailable,
+      'failed' => UsbCameraMediaScanState.failed,
+      _ => UsbCameraMediaScanState.empty,
+    };
+  }
+}
+
 class UsbCameraCapabilities {
   const UsbCameraCapabilities({
     required this.ingestionMode,
@@ -142,6 +158,61 @@ class UsbCameraPhoto {
 /// Generic name for camera files. The alias keeps the original public
 /// [UsbCameraPhoto] API source-compatible for existing integrations.
 typedef UsbCameraMediaFile = UsbCameraPhoto;
+
+class UsbCameraMediaScanResult {
+  const UsbCameraMediaScanResult({
+    required this.media,
+    required this.state,
+    required this.backend,
+    required this.folderCount,
+    required this.fileCount,
+    required this.errors,
+  });
+
+  static const empty = UsbCameraMediaScanResult(
+    media: [],
+    state: UsbCameraMediaScanState.empty,
+    backend: '',
+    folderCount: 0,
+    fileCount: 0,
+    errors: [],
+  );
+
+  final List<UsbCameraMediaFile> media;
+  final UsbCameraMediaScanState state;
+  final String backend;
+  final int folderCount;
+  final int fileCount;
+  final List<String> errors;
+
+  bool get storageBrowsable =>
+      state == UsbCameraMediaScanState.ready ||
+      state == UsbCameraMediaScanState.empty;
+
+  factory UsbCameraMediaScanResult.fromMap(Map<dynamic, dynamic> map) {
+    final rawMedia = map['media'];
+    final rawErrors = map['errors'];
+    return UsbCameraMediaScanResult(
+      media: rawMedia is List
+          ? rawMedia
+              .whereType<Map<dynamic, dynamic>>()
+              .map(UsbCameraPhoto.fromMap)
+              .where((file) => file.isSupportedMedia)
+              .toList(growable: false)
+          : const [],
+      state: UsbCameraMediaScanState.fromWire(map['state']?.toString()),
+      backend: map['backend']?.toString() ?? '',
+      folderCount: _intValue(map['folderCount'] ?? map['folder_count']),
+      fileCount: _intValue(map['fileCount'] ?? map['file_count']),
+      errors: rawErrors is List
+          ? rawErrors
+              .map((item) => item.toString().trim())
+              .where((item) => item.isNotEmpty)
+              .toList(growable: false)
+          : const [],
+    );
+  }
+}
 
 class CameraTransferProgress {
   const CameraTransferProgress({
