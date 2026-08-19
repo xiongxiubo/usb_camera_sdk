@@ -169,6 +169,67 @@ internal class CanonPtpBackend(
         photos.sortedByDescending { it.shotAt }
     }
 
+    fun listPhotosPage(
+        cursor: String?,
+        limit: Int,
+        mediaType: String?,
+    ): CanonPtpMediaPage = synchronized(ioLock) {
+        check(running.get()) { "佳能 PTP 未连接" }
+        val snapshot = readHandleSnapshot()
+        updateCatalogForFullList(snapshot)
+        val handles = snapshot.handlesByStorage.values
+            .flatMap { storageHandles -> storageHandles.asIterable() }
+            .sortedByDescending { handle -> handle.toUInt() }
+        val cursorHandle = cursor?.let { value ->
+            runCatching { CanonPtpProtocol.parsePhotoId(value) }.getOrNull()
+        }
+        var index = cursorHandle
+            ?.let { handle -> handles.indexOf(handle).takeIf { it >= 0 }?.plus(1) }
+            ?: 0
+        var inspectedSinceMaintenance = 0
+        var lastInspectedHandle: Int? = null
+        val media = mutableListOf<CanonPtpPhoto>()
+        while (index < handles.size && media.size < limit) {
+            val handle = handles[index]
+            index += 1
+            lastInspectedHandle = handle
+            val cached = photoCache[handle]
+            if (cached != null) {
+                if (cached.matchesMediaType(mediaType)) media += cached
+                continue
+            }
+            if (inspectedHandles.contains(handle)) continue
+            val info = getObjectInfo(handle)
+            inspectedHandles += handle
+            info?.takeIf { it.isPhoto }?.toPhoto(handle)?.let { photo ->
+                photoCache[handle] = photo
+                if (photo.matchesMediaType(mediaType)) media += photo
+            }
+            inspectedSinceMaintenance += 1
+            if (inspectedSinceMaintenance >= FULL_SCAN_MAINTENANCE_BATCH) {
+                performLongOperationMaintenance()
+                inspectedSinceMaintenance = 0
+            }
+        }
+        performLongOperationMaintenance()
+        val hasMore = index < handles.size
+        log(
+            "canon_ptp page cursor=${cursor ?: "start"} limit=$limit " +
+                "returned=${media.size} inspected=$index total=${handles.size} hasMore=$hasMore",
+        )
+        CanonPtpMediaPage(
+            media = media.sortedByDescending { it.shotAt },
+            nextCursor = if (hasMore && lastInspectedHandle != null) {
+                CanonPtpProtocol.photoId(lastInspectedHandle)
+            } else {
+                null
+            },
+            hasMore = hasMore,
+            totalCount = handles.size,
+            folderCount = snapshot.storageIds.size,
+        )
+    }
+
     fun listNewPhotos(): List<CanonPtpPhoto> = synchronized(ioLock) {
         check(running.get()) { "佳能 PTP 未连接" }
         val snapshot = readHandleSnapshot()
@@ -622,6 +683,15 @@ internal class CanonPtpBackend(
 
     private fun Int.hex() = "0x${toString(16)}"
 
+    private fun CanonPtpPhoto.matchesMediaType(mediaType: String?): Boolean {
+        val extension = fileName.substringAfterLast('.', "").lowercase()
+        return when (mediaType) {
+            "image" -> extension !in VIDEO_EXTENSIONS
+            "video" -> extension in VIDEO_EXTENSIONS
+            else -> true
+        }
+    }
+
     private data class PtpHeader(
         val length: Int,
         val type: Int,
@@ -693,9 +763,20 @@ internal class CanonPtpBackend(
             "jpg", "jpeg", "jpe", "cr2", "cr3", "raw",
             "mp4", "mov", "m4v", "avi", "mts", "m2ts", "webm",
         )
+        private val VIDEO_EXTENSIONS = setOf(
+            "mp4", "mov", "m4v", "avi", "mts", "m2ts", "webm",
+        )
         internal const val PHOTO_ID_PREFIX = "canon-ptp:"
     }
 }
+
+internal data class CanonPtpMediaPage(
+    val media: List<CanonPtpPhoto>,
+    val nextCursor: String?,
+    val hasMore: Boolean,
+    val totalCount: Int,
+    val folderCount: Int,
+)
 
 internal data class CanonPtpPhoto(
     val id: String,

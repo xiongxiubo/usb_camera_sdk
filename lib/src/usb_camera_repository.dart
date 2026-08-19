@@ -113,6 +113,29 @@ class UsbCameraRepository {
         : UsbCameraMediaScanResult.fromMap(result);
   }
 
+  Future<UsbCameraMediaPage> scanMediaPage({
+    String folder = '/',
+    String? cursor,
+    int limit = 100,
+    UsbCameraMediaType? mediaType,
+    bool refresh = false,
+  }) async {
+    if (!isSupported) return UsbCameraMediaPage.empty;
+    final result = await _methodChannel.invokeMapMethod<dynamic, dynamic>(
+      'scanMediaPage',
+      {
+        'folder': folder,
+        if (cursor != null && cursor.isNotEmpty) 'cursor': cursor,
+        'limit': limit,
+        if (mediaType != null) 'mediaType': mediaType.name,
+        'refresh': refresh,
+      },
+    );
+    return result == null
+        ? UsbCameraMediaPage.empty
+        : UsbCameraMediaPage.fromMap(result);
+  }
+
   Future<List<UsbCameraPhoto>> listNewPhotos({String folder = '/'}) async {
     if (!isSupported) return const [];
     final result = await _methodChannel.invokeListMethod<dynamic>(

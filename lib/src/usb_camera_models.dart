@@ -214,6 +214,66 @@ class UsbCameraMediaScanResult {
   }
 }
 
+class UsbCameraMediaPage {
+  const UsbCameraMediaPage({
+    required this.media,
+    required this.state,
+    required this.backend,
+    required this.folderCount,
+    required this.fileCount,
+    required this.nextCursor,
+    required this.hasMore,
+    required this.errors,
+  });
+
+  static const empty = UsbCameraMediaPage(
+    media: [],
+    state: UsbCameraMediaScanState.empty,
+    backend: '',
+    folderCount: 0,
+    fileCount: 0,
+    nextCursor: null,
+    hasMore: false,
+    errors: [],
+  );
+
+  final List<UsbCameraMediaFile> media;
+  final UsbCameraMediaScanState state;
+  final String backend;
+  final int folderCount;
+  final int fileCount;
+  final String? nextCursor;
+  final bool hasMore;
+  final List<String> errors;
+
+  factory UsbCameraMediaPage.fromMap(Map<dynamic, dynamic> map) {
+    final rawMedia = map['media'];
+    final rawErrors = map['errors'];
+    return UsbCameraMediaPage(
+      media: rawMedia is List
+          ? rawMedia
+              .whereType<Map<dynamic, dynamic>>()
+              .map(UsbCameraPhoto.fromMap)
+              .where((file) => file.isSupportedMedia)
+              .toList(growable: false)
+          : const [],
+      state: UsbCameraMediaScanState.fromWire(map['state']?.toString()),
+      backend: map['backend']?.toString() ?? '',
+      folderCount: _intValue(map['folderCount'] ?? map['folder_count']),
+      fileCount: _intValue(map['fileCount'] ?? map['file_count']),
+      nextCursor:
+          map['nextCursor']?.toString() ?? map['next_cursor']?.toString(),
+      hasMore: map['hasMore'] == true || map['has_more'] == true,
+      errors: rawErrors is List
+          ? rawErrors
+              .map((item) => item.toString().trim())
+              .where((item) => item.isNotEmpty)
+              .toList(growable: false)
+          : const [],
+    );
+  }
+}
+
 class CameraTransferProgress {
   const CameraTransferProgress({
     required this.fileName,

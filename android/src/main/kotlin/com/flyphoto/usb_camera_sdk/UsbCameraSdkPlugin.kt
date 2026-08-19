@@ -49,7 +49,12 @@ class UsbCameraSdkPlugin :
     private val pendingMediaEvents = mutableListOf<Map<String, Any?>>()
     private val mediaEventPollScheduled = AtomicBoolean(false)
     private val genericMediaCatalog = mutableSetOf<String>()
+    private val genericMediaItems = mutableListOf<Map<String, Any?>>()
+    private var genericMediaCatalogInitialized = false
+    private var genericCatalogFolder = "/"
     private var lastGenericMediaPollAtMs = 0L
+    private var genericUnchangedPolls = 0
+    private var genericMediaPollIntervalMs = GENERIC_MEDIA_POLL_INTERVAL_MS
     private var eventSink: EventChannel.EventSink? = null
     private var pendingPermissionResult: MethodChannel.Result? = null
     @Volatile
@@ -169,6 +174,17 @@ class UsbCameraSdkPlugin :
             }
             "scanMedia" -> cameraDispatcher.execute {
                 mainResult.success(scanMedia(call.argument<String>("folder") ?: "/").toMap())
+            }
+            "scanMediaPage" -> cameraDispatcher.execute {
+                mainResult.success(
+                    scanMediaPage(
+                        folder = call.argument<String>("folder") ?: "/",
+                        cursor = call.argument<String>("cursor"),
+                        limit = call.argument<Int>("limit") ?: DEFAULT_MEDIA_PAGE_SIZE,
+                        mediaType = call.argument<String>("mediaType"),
+                        refresh = call.argument<Boolean>("refresh") == true,
+                    ).toMap(),
+                )
             }
             "listNewPhotos" -> cameraDispatcher.execute {
                 mainResult.success(listNewPhotos(call.argument<String>("folder") ?: "/"))
@@ -331,8 +347,7 @@ class UsbCameraSdkPlugin :
         appendCameraLog("openDevice ok fd=${connection.fileDescriptor}")
 
         disconnectCamera()
-        genericMediaCatalog.clear()
-        lastGenericMediaPollAtMs = 0L
+        clearGenericMediaCatalog()
         activeConnection = connection
         activeDevice = device
 
@@ -502,6 +517,38 @@ class UsbCameraSdkPlugin :
         return scanGenericMedia(folder)
     }
 
+    private fun scanMediaPage(
+        folder: String,
+        cursor: String?,
+        limit: Int,
+        mediaType: String?,
+        refresh: Boolean,
+    ): CameraMediaPagePayload {
+        val pageLimit = limit.coerceIn(1, MAX_MEDIA_PAGE_SIZE)
+        canonPtpBackend?.let { backend ->
+            return runCatching {
+                val page = backend.listPhotosPage(cursor, pageLimit, mediaType)
+                CameraMediaPagePayload(
+                    media = page.media.map { photo -> photo.toMap() },
+                    state = if (page.media.isEmpty() && !page.hasMore) "empty" else "ready",
+                    backend = activeBackend,
+                    folderCount = page.folderCount,
+                    fileCount = page.totalCount,
+                    nextCursor = page.nextCursor,
+                    hasMore = page.hasMore,
+                )
+            }.getOrElse { error ->
+                appendCameraLog("canon_ptp page scan failed: ${error.message}")
+                CameraMediaPagePayload(
+                    state = "failed",
+                    backend = activeBackend,
+                    errors = listOf(error.message ?: "佳能媒体分页扫描失败"),
+                )
+            }
+        }
+        return scanGenericMediaPage(folder, cursor, pageLimit, mediaType, refresh)
+    }
+
     private fun scanGenericMedia(folder: String): CameraMediaScanPayload {
         val (encodedFiles, reportValues) = synchronized(cameraOperationLock) {
             bridge.nativeListFiles(folder) to bridge.nativeGetLastMediaScanReport()
@@ -551,6 +598,75 @@ class UsbCameraSdkPlugin :
             errors = report.errors,
         )
     }
+
+    private fun scanGenericMediaPage(
+        folder: String,
+        cursor: String?,
+        limit: Int,
+        mediaType: String?,
+        refresh: Boolean,
+    ): CameraMediaPagePayload {
+        if (refresh ||
+            !genericMediaCatalogInitialized ||
+            genericCatalogFolder != folder
+        ) {
+            val payload = scanGenericMedia(folder)
+            replaceGenericMediaCatalog(payload.media, folder)
+        }
+        val candidates = genericMediaItems.filter { mediaMatchesType(it, mediaType) }
+        val startIndex = cursor?.let { token ->
+            candidates.indexOfFirst { mediaKey(it) == token }
+                .takeIf { it >= 0 }
+                ?.plus(1)
+        } ?: 0
+        val page = candidates.drop(startIndex).take(limit)
+        val hasMore = startIndex + page.size < candidates.size
+        return CameraMediaPagePayload(
+            media = page,
+            state = if (candidates.isEmpty()) "empty" else "ready",
+            backend = activeBackend,
+            folderCount = if (candidates.isEmpty()) 0 else 1,
+            fileCount = candidates.size,
+            nextCursor = page.lastOrNull()?.let(::mediaKey),
+            hasMore = hasMore,
+        )
+    }
+
+    private fun replaceGenericMediaCatalog(
+        media: List<Map<String, Any?>>,
+        folder: String,
+    ) {
+        val supported = media
+            .filter { it["mediaType"] != "unknown" }
+            .distinctBy(::mediaKey)
+            .sortedWith(genericMediaComparator)
+        genericMediaItems.clear()
+        genericMediaItems.addAll(supported)
+        genericMediaCatalog.clear()
+        genericMediaCatalog.addAll(supported.map(::mediaKey))
+        genericCatalogFolder = folder
+        genericMediaCatalogInitialized = true
+    }
+
+    private fun mediaMatchesType(media: Map<String, Any?>, mediaType: String?): Boolean {
+        return when (mediaType) {
+            "image", "video" -> media["mediaType"]?.toString() == mediaType
+            else -> true
+        }
+    }
+
+    private fun mediaKey(media: Map<String, Any?>): String {
+        return genericMediaKey(
+            media["folder"]?.toString().orEmpty(),
+            media["fileName"]?.toString().orEmpty(),
+        )
+    }
+
+    private val genericMediaComparator = compareByDescending<Map<String, Any?>> {
+        val shotAt = it["shotAt"]?.toString().orEmpty()
+        if (shotAt == "--:--:--") "" else shotAt
+    }.thenByDescending { it["fileName"]?.toString().orEmpty().lowercase() }
+        .thenByDescending { it["folder"]?.toString().orEmpty().lowercase() }
 
     private fun listMedia(folder: String): List<Map<String, Any?>> = scanMedia(folder).media
 
@@ -657,7 +773,7 @@ class UsbCameraSdkPlugin :
             }
             if (mediaEventListening.get()) handleMediaEventResult(event)
             if (mediaEventListening.get() && canonPtpBackend == null &&
-                System.currentTimeMillis() - lastGenericMediaPollAtMs >= GENERIC_MEDIA_POLL_INTERVAL_MS
+                System.currentTimeMillis() - lastGenericMediaPollAtMs >= genericMediaPollIntervalMs
             ) {
                 runCatching { pollGenericMediaCatalog() }
                     .onFailure { error ->
@@ -717,14 +833,15 @@ class UsbCameraSdkPlugin :
     }
 
     private fun seedGenericMediaCatalog() {
-        val files = synchronized(cameraOperationLock) {
-            bridge.nativeListFiles("/").toList()
-        }
-        val keys = files.mapNotNull { encodedMediaKey(it) }.toSet()
-        genericMediaCatalog.clear()
-        genericMediaCatalog.addAll(keys)
+        val payload = scanGenericMedia("/")
+        replaceGenericMediaCatalog(payload.media, "/")
         lastGenericMediaPollAtMs = System.currentTimeMillis()
-        appendCameraLog("generic media catalog baseline files=${files.size} supported=${keys.size}")
+        genericUnchangedPolls = 0
+        genericMediaPollIntervalMs = GENERIC_MEDIA_POLL_INTERVAL_MS
+        appendCameraLog(
+            "generic media catalog baseline files=${payload.fileCount} " +
+                "supported=${payload.media.size}",
+        )
     }
 
     private fun pollGenericMediaCatalog() {
@@ -746,15 +863,29 @@ class UsbCameraSdkPlugin :
             if (genericMediaCatalog.contains(key)) discovered += 1
         }
         if (discovered > 0) {
+            genericUnchangedPolls = 0
+            genericMediaPollIntervalMs = GENERIC_MEDIA_POLL_INTERVAL_MS
             appendCameraLog("generic media catalog discovered files=$discovered")
+        } else {
+            genericUnchangedPolls += 1
+            if (genericUnchangedPolls >= GENERIC_MEDIA_BACKOFF_AFTER_POLLS) {
+                genericMediaPollIntervalMs = GENERIC_MEDIA_POLL_BACKOFF_INTERVAL_MS
+            }
         }
+        lastGenericMediaPollAtMs = System.currentTimeMillis()
     }
 
     private fun publishGenericMedia(payload: Map<String, Any?>) {
         val folder = payload["folder"]?.toString().orEmpty()
         val name = payload["fileName"]?.toString().orEmpty()
         if (name.isBlank() || payload["mediaType"] == "unknown") return
-        if (!genericMediaCatalog.add(genericMediaKey(folder, name))) return
+        val key = genericMediaKey(folder, name)
+        if (!genericMediaCatalog.add(key)) return
+        genericMediaItems.removeAll { mediaKey(it) == key }
+        genericMediaItems.add(0, payload)
+        genericMediaCatalogInitialized = true
+        genericUnchangedPolls = 0
+        genericMediaPollIntervalMs = GENERIC_MEDIA_POLL_INTERVAL_MS
         synchronized(pendingMediaEventLock) {
             pendingMediaEvents.add(payload)
         }
@@ -845,10 +976,19 @@ class UsbCameraSdkPlugin :
         activeConnection = null
         activeDevice = null
         activeBackend = "libgphoto2"
-        genericMediaCatalog.clear()
-        lastGenericMediaPollAtMs = 0L
+        clearGenericMediaCatalog()
         appendCameraLog("disconnect complete")
         emitEvent("disconnected", null)
+    }
+
+    private fun clearGenericMediaCatalog() {
+        genericMediaCatalog.clear()
+        genericMediaItems.clear()
+        genericMediaCatalogInitialized = false
+        genericCatalogFolder = "/"
+        lastGenericMediaPollAtMs = 0L
+        genericUnchangedPolls = 0
+        genericMediaPollIntervalMs = GENERIC_MEDIA_POLL_INTERVAL_MS
     }
 
     private fun handleCanonPhotoAdded(photo: CanonPtpPhoto) {
@@ -1072,6 +1212,28 @@ private data class CameraMediaScanPayload(
     )
 }
 
+private data class CameraMediaPagePayload(
+    val media: List<Map<String, Any?>> = emptyList(),
+    val state: String,
+    val backend: String,
+    val folderCount: Int = 0,
+    val fileCount: Int = 0,
+    val nextCursor: String? = null,
+    val hasMore: Boolean = false,
+    val errors: List<String> = emptyList(),
+) {
+    fun toMap(): Map<String, Any?> = mapOf(
+        "media" to media,
+        "state" to state,
+        "backend" to backend,
+        "folderCount" to folderCount,
+        "fileCount" to fileCount,
+        "nextCursor" to nextCursor,
+        "hasMore" to hasMore,
+        "errors" to errors,
+    )
+}
+
 private data class NativeMediaScanReport(
     val rootFilesResult: Int,
     val rootFoldersResult: Int,
@@ -1118,4 +1280,8 @@ private val VIDEO_EXTENSIONS = setOf(
 )
 
 private const val SONY_VENDOR_ID = 0x054c
-private const val GENERIC_MEDIA_POLL_INTERVAL_MS = 2_000L
+private const val DEFAULT_MEDIA_PAGE_SIZE = 100
+private const val MAX_MEDIA_PAGE_SIZE = 200
+private const val GENERIC_MEDIA_POLL_INTERVAL_MS = 15_000L
+private const val GENERIC_MEDIA_POLL_BACKOFF_INTERVAL_MS = 30_000L
+private const val GENERIC_MEDIA_BACKOFF_AFTER_POLLS = 3
