@@ -30,3 +30,24 @@ The platform channels are:
 
 - `flyphoto/camera_usb`
 - `flyphoto/camera_usb_events`
+
+## Android development
+
+Open `app/android` for Android development with the Flutter embedding dependencies.
+The SDK's `android` directory also supports standalone Gradle configuration and
+IDE import with JDK 17 and Gradle 9.1.0. Set `ANDROID_HOME` or `sdk.dir` in a local,
+untracked `android/local.properties` file to locate the Android SDK.
+
+From the repository root:
+
+```bash
+# Check standalone configuration using the app's Gradle wrapper.
+app/android/gradlew -p packages/usb_camera_sdk/android help
+
+# Compile and test the Android plugin through its Flutter host.
+app/android/gradlew -p app/android :usb_camera_sdk:testDebugUnitTest
+```
+
+Standalone plugin versions and AGP compatibility flags match `app/android`.
+Standalone SDK defaults are compile SDK 36, minimum SDK 24, and NDK
+28.2.13676358; when loaded by a Flutter app, the SDK uses Flutter's values instead.
